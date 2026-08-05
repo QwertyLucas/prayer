@@ -15,6 +15,9 @@ export default [
       '**/*.tsbuildinfo',
       '.worktrees/**',
       '.claude/worktrees/**',
+      // Personal scratch workspace — gitignored via `tmp/`, so never linted either.
+      // Without this, a stray scratch script blocks every push via the pre-push hook.
+      '**/tmp/**',
       'pnpm-lock.yaml',
       // JS/CJS migrations are plain CommonJS files — not subject to ESM/TS lint rules
       'packages/db/migrations/*.cjs',
