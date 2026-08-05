@@ -59,3 +59,6 @@ tmp/
 
 # git worktrees
 .worktrees/
+
+# Brainstorming visual-companion screens (regenerated per session)
+.superpowers/
