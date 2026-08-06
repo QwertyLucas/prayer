@@ -8,12 +8,16 @@ import {
   makeRng,
 } from '../src/bench-fixtures.js';
 import {
+  ISOLATED_MODERATOR_COUNT,
+  MODERATOR_COUNT,
+  SUPER_USER_COUNT,
   assignKinds,
   loadBenchDataset,
   loadGroups,
   loadMembers,
   loadOrg,
   loadPrayers,
+  loadPrivilegedRoles,
   loadTags,
 } from '../src/bench-loader.js';
 import { createBenchDb, type BenchDb } from '../src/bench-schema.js';
@@ -129,6 +133,174 @@ describe('loadGroups', () => {
 
     const shape = (m: Map<string, string[]>) => [...m.values()].map((v) => v.length);
     expect(shape(ga)).toEqual(shape(gb));
+  });
+
+  it('does not encode connectivity in member id order', async () => {
+    // Regression test. targets used to be handed out by *position* in
+    // memberIds, and memberIds are UUIDv7 in creation order, so the first 100
+    // users by id were exactly the isolated cohort and the last 5 were exactly
+    // the 6-group cohort. `SELECT id FROM users ORDER BY id LIMIT n` in Plan
+    // 2's oracle or Plan 3's harness would then sample one connectivity cohort
+    // while believing it sampled the population — the same "position encodes a
+    // property" hazard as the audience-kind/post-id correlation, one level up.
+    const orgId = await loadOrg(db, 'bench-connectivity-order');
+    const members = await loadMembers(db, orgId, 1000);
+    const byMember = await loadGroups(db, orgId, members, makeRng(4));
+
+    // memberIds are returned in ascending id order (asserted above), so
+    // slicing them is slicing `ORDER BY id`.
+    const sizes = members.map((id) => (byMember.get(id) ?? []).length);
+    const decile = (n: number) => sizes.slice(n * 100, n * 100 + 100);
+    const isolatedIn = (xs: number[]) => xs.filter((n) => n === 0).length;
+
+    // 100 isolated members over 10 deciles: ~10 each if uncorrelated, 100 in
+    // the first decile and 0 everywhere else under the old code.
+    for (let d = 0; d < 10; d++) {
+      expect(isolatedIn(decile(d)), `decile ${d}`).toBeLessThan(30);
+    }
+    expect(isolatedIn(sizes)).toBe(100);
+
+    // Mean group count must not trend across the id range either — the old
+    // code went from 0 in the first decile to 6 in the last.
+    const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
+    expect(Math.abs(mean(sizes.slice(0, 500)) - mean(sizes.slice(500)))).toBeLessThan(0.5);
+  });
+
+  it('sizes groups by tier instead of uniformly', async () => {
+    // Uniform draws gave every group min 24 / avg 40 / max 57. The design
+    // calls for a handful of large life-stage groups (~150) and a long tail of
+    // small ministry (~29) and home (~26) groups, because a large "hot"
+    // audience is the only source of per-group selectivity variance an index
+    // experiment can observe. Ranges, not exact numbers: the totals are exact
+    // but the per-group sizes are the expectation of a weighted draw.
+    const orgId = await loadOrg(db, 'bench-tiered-sizes');
+    const members = await loadMembers(db, orgId, 1000);
+    await loadGroups(db, orgId, members, makeRng(23));
+
+    const rows = await db
+      .selectFrom('group_members')
+      .innerJoin('groups', 'groups.id', 'group_members.group_id')
+      .select(({ fn }) => ['groups.name', fn.count<string>('group_members.user_id').as('n')])
+      .where('groups.church_id', '=', orgId)
+      .groupBy('groups.name')
+      .execute();
+    expect(rows).toHaveLength(GROUP_FIXTURES.length);
+
+    const tierOf = new Map(GROUP_FIXTURES.map((g) => [g.name, g.tier]));
+    const sizes = { life_stage: [] as number[], ministry: [] as number[], home: [] as number[] };
+    for (const r of rows) {
+      const tier = tierOf.get(r.name);
+      if (tier) sizes[tier].push(Number(r.n));
+    }
+    const avg = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
+
+    expect(avg(sizes.life_stage)).toBeGreaterThan(120);
+    expect(avg(sizes.life_stage)).toBeLessThan(180);
+    expect(avg(sizes.ministry)).toBeGreaterThan(20);
+    expect(avg(sizes.ministry)).toBeLessThan(40);
+    expect(avg(sizes.home)).toBeGreaterThan(18);
+    expect(avg(sizes.home)).toBeLessThan(36);
+
+    // The tiers must not merely differ on average — the smallest life-stage
+    // group has to out-mass the largest small group, or "hot audience" is not
+    // a property any single query can observe.
+    expect(Math.min(...sizes.life_stage)).toBeGreaterThan(
+      Math.max(...sizes.ministry, ...sizes.home),
+    );
+
+    // The exact totals GROUP_COUNT_BUCKETS fixes survive the weighting.
+    const total = [...sizes.life_stage, ...sizes.ministry, ...sizes.home].reduce(
+      (a, b) => a + b,
+      0,
+    );
+    expect(total).toBe(2300);
+  });
+
+  it('refuses a population larger than GROUP_COUNT_BUCKETS covers', async () => {
+    // GROUP_COUNT_BUCKETS is a fixed 1,000-member histogram. Members past the
+    // cap used to take the `?? 0` fallback and land in zero groups, so
+    // { members: 2000 } produced 1,100 isolated members rather than 100 —
+    // silently, with the summary still reporting a valid-looking load.
+    const orgId = await loadOrg(db, 'bench-over-cap');
+    const members = await loadMembers(db, orgId, 1001);
+    await expect(loadGroups(db, orgId, members, makeRng(24))).rejects.toThrow(
+      /GROUP_COUNT_BUCKETS covers 1000 members but 1001 were requested/,
+    );
+  });
+});
+
+describe('loadPrivilegedRoles', () => {
+  it('promotes moderators and super_users, including an isolated moderator', async () => {
+    // Rule ② grants moderators access to group-targeted posts; rule ③ grants
+    // them nothing on tag-targeted ones. With every user_orgs row set to
+    // 'member' (as it was), Plan 2's differential oracle could not detect the
+    // group clause being dropped, nor — far worse — a role clause being
+    // wrongly added to the sealed tag path.
+    const orgId = await loadOrg(db, 'bench-roles');
+    const members = await loadMembers(db, orgId, 1000);
+    const rng = makeRng(25);
+    const byMember = await loadGroups(db, orgId, members, rng);
+    const roles = await loadPrivilegedRoles(db, orgId, members, byMember, rng);
+
+    expect(roles.moderators).toHaveLength(MODERATOR_COUNT);
+    expect(roles.superUsers).toHaveLength(SUPER_USER_COUNT);
+    expect(new Set([...roles.moderators, ...roles.superUsers]).size).toBe(
+      MODERATOR_COUNT + SUPER_USER_COUNT,
+    );
+
+    const rows = await db
+      .selectFrom('user_orgs')
+      .select(({ fn }) => ['role', fn.count<string>('user_id').as('n')])
+      .where('org_id', '=', orgId)
+      .groupBy('role')
+      .execute();
+    const byRole = Object.fromEntries(rows.map((r) => [r.role, Number(r.n)]));
+    expect(byRole).toEqual({
+      member: 1000 - MODERATOR_COUNT - SUPER_USER_COUNT,
+      moderator: MODERATOR_COUNT,
+      super_user: SUPER_USER_COUNT,
+    });
+
+    // A moderator who is in the targeted group is already visible under the
+    // membership clause, so only an isolated one makes the role clause
+    // observable at all. The isolated cohort is 10% of the population, so a
+    // plain uniform draw of 20 moderators would supply two only ~60% of the
+    // time — swept across seeds so the test measures the guarantee rather than
+    // this seed's luck.
+    for (let seed = 30; seed < 36; seed++) {
+      const r = await loadPrivilegedRoles(db, orgId, members, byMember, makeRng(seed));
+      const isolatedMods = r.moderators.filter((id) => (byMember.get(id) ?? []).length === 0);
+      expect(isolatedMods.length, `seed ${seed}`).toBeGreaterThanOrEqual(ISOLATED_MODERATOR_COUNT);
+      // …and moderators who ARE connected, so the "moderator not in *this*
+      // group" case exists for group-targeted posts too.
+      expect(r.moderators.length - isolatedMods.length, `seed ${seed}`).toBeGreaterThanOrEqual(1);
+    }
+  });
+
+  it('is deterministic for a given seed', async () => {
+    const run = async (slug: string): Promise<number[]> => {
+      const orgId = await loadOrg(db, slug);
+      const members = await loadMembers(db, orgId, 1000);
+      const rng = makeRng(26);
+      const byMember = await loadGroups(db, orgId, members, rng);
+      const roles = await loadPrivilegedRoles(db, orgId, members, byMember, rng);
+      // Positions, not ids: ids are freshly minted per run.
+      return roles.moderators.map((id) => members.indexOf(id)).sort((a, b) => a - b);
+    };
+    expect(await run('bench-roles-det-1')).toEqual(await run('bench-roles-det-2'));
+  });
+
+  it('clamps to what a degenerate population can supply instead of throwing', async () => {
+    // At N=20 GROUP_COUNT_BUCKETS puts everyone in the zero-group bucket, so
+    // there is no connected member to promote. Roles are metadata, not a
+    // dataset invariant — a small population should still load.
+    const orgId = await loadOrg(db, 'bench-roles-small');
+    const members = await loadMembers(db, orgId, 20);
+    const rng = makeRng(27);
+    const byMember = await loadGroups(db, orgId, members, rng);
+    const roles = await loadPrivilegedRoles(db, orgId, members, byMember, rng);
+    expect(roles.moderators.length).toBeGreaterThan(0);
+    expect(roles.moderators.length).toBeLessThanOrEqual(MODERATOR_COUNT);
   });
 });
 
@@ -492,6 +664,8 @@ describe('loadBenchDataset', () => {
     const summary = await loadBenchDataset(db, { slug: 'bench-full', members: 1000, seed: 21 });
 
     expect(summary.members).toBe(1000);
+    expect(summary.moderators).toBe(MODERATOR_COUNT);
+    expect(summary.superUsers).toBe(SUPER_USER_COUNT);
     expect(summary.groups).toBe(58);
     expect(summary.prayers).toBe(10000);
     expect(summary.tags).toBeGreaterThanOrEqual(1000);
@@ -504,5 +678,44 @@ describe('loadBenchDataset', () => {
       .where('posts.org_id', '=', summary.orgId)
       .executeTakeFirstOrThrow();
     expect(Number(actual.n)).toBe(summary.audiences);
+  });
+
+  it('rolls the whole load back when the mix turns out to be infeasible', async () => {
+    // The five load steps used to be five independent write sequences.
+    // loadPrayers throws by design on an infeasible mix — the first thing that
+    // happens when someone tunes a new one — and that left 1 org, N users, 58
+    // groups and 0 posts behind. assertLoadable's posts check waved the next
+    // run through, loadOrg adopted the leftover org, and the second run
+    // appended a second population to it: the printed summary said 1,000
+    // members while the church held 2,000 and the isolated cohort was 200.
+    const slug = 'bench-rollback';
+
+    // N=20: every member is in the zero-group bucket, so no group-requiring
+    // kind can be produced and loadPrayers refuses the load.
+    await expect(loadBenchDataset(db, { slug, members: 20, seed: 28 })).rejects.toThrow(
+      /infeasible for this population/,
+    );
+
+    const orgs = await db.selectFrom('orgs').select('id').where('slug', '=', slug).execute();
+    expect(orgs).toHaveLength(0);
+
+    // Not just "zero posts" — zero *users*. That is the state that made the
+    // next run silently wrong, and the state the old test at this spot missed.
+    const users = await db
+      .selectFrom('users')
+      .innerJoin('user_orgs', 'user_orgs.user_id', 'users.id')
+      .innerJoin('orgs', 'orgs.id', 'user_orgs.org_id')
+      .select(({ fn }) => fn.count<string>('users.id').as('n'))
+      .where('orgs.slug', '=', slug)
+      .executeTakeFirstOrThrow();
+    expect(Number(users.n)).toBe(0);
+
+    const groups = await db
+      .selectFrom('groups')
+      .innerJoin('orgs', 'orgs.id', 'groups.church_id')
+      .select(({ fn }) => fn.count<string>('groups.id').as('n'))
+      .where('orgs.slug', '=', slug)
+      .executeTakeFirstOrThrow();
+    expect(Number(groups.n)).toBe(0);
   });
 });

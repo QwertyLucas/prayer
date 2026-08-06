@@ -50,6 +50,50 @@ export function pickDistinct<T>(rng: () => number, xs: readonly T[], n: number):
   return out;
 }
 
+/**
+ * Up to `n` distinct items, drawn with probability proportional to `weights[i]`.
+ *
+ * Roulette-wheel selection without replacement: each draw picks from the
+ * remaining pool in proportion to the weights still in it. Uniform
+ * `pickDistinct` gives every group the same expected size; weighting is what
+ * makes a life-stage group ~150 members and a home group ~26, which is the
+ * per-group selectivity variance an index experiment cares about.
+ */
+export function pickDistinctWeighted<T>(
+  rng: () => number,
+  xs: readonly T[],
+  weights: readonly number[],
+  n: number,
+): T[] {
+  const pool = xs.map((value, i) => ({ value, weight: weights[i] ?? 0 }));
+  const out: T[] = [];
+  const target = Math.min(n, pool.length);
+
+  while (out.length < target) {
+    const total = pool.reduce((a, p) => a + p.weight, 0);
+    if (!(total > 0)) {
+      throw new Error('pickDistinctWeighted needs at least one positive weight in the pool');
+    }
+    let r = rng() * total;
+    // Defaults to the last entry so floating-point drift at the very top of
+    // the wheel lands on a real item rather than falling through.
+    let idx = pool.length - 1;
+    for (let i = 0; i < pool.length; i++) {
+      const p = pool[i];
+      if (p === undefined) continue;
+      r -= p.weight;
+      if (r <= 0) {
+        idx = i;
+        break;
+      }
+    }
+    const [taken] = pool.splice(idx, 1);
+    if (taken !== undefined) out.push(taken.value);
+  }
+
+  return out;
+}
+
 /** Turns [{count: 2, value: 'a'}] into ['a', 'a']. */
 export function expand<T>(buckets: readonly { count: number; value: T }[]): T[] {
   const out: T[] = [];
@@ -86,6 +130,26 @@ export const GROUP_FIXTURES: readonly GroupFixture[] = [
   ...HOME_GROUPS,
 ];
 
+/**
+ * Target average size, in members, for a group of each tier — used as the
+ * sampling weight in `loadGroups`, not as a hard cap.
+ *
+ * A life-stage group is the congregation sliced by age or stage, so nearly
+ * everyone is in one; ministry teams and home groups are small by nature. The
+ * numbers come from the design spec's group table (6 * 150 + 12 * 29 + 40 * 26
+ * ≈ 2,300, the membership total GROUP_COUNT_BUCKETS fixes exactly).
+ *
+ * What is exact is the 2,300 total and the 100-member isolated cohort — those
+ * come from GROUP_COUNT_BUCKETS and are unaffected by how the draw is
+ * weighted. The per-tier sizes are the *expectation* of a weighted draw
+ * without replacement, so realised sizes land near, not on, these numbers.
+ */
+export const TIER_TARGET_SIZE: Readonly<Record<GroupTier, number>> = {
+  life_stage: 150,
+  ministry: 29,
+  home: 26,
+};
+
 export const TAG_NAMES: readonly string[] = [
   'family',
   'close friends',
@@ -97,12 +161,13 @@ export const TAG_NAMES: readonly string[] = [
 
 /**
  * How many groups each member belongs to. The 100 zero-group members are
- * deliberate: a well-connected member's feed is fast because Postgres finds 20
- * visible posts and stops, while an isolated member forces a walk back through
- * thousands of invisible posts to fill one page. Without them the benchmark
- * only ever reports the easy case.
+ * deliberate: they are the least-connected cohort, so if group/tag membership
+ * has any effect on how far the feed query must walk to fill a page, they are
+ * where it shows up. Without them the benchmark only ever reports the
+ * well-connected case.
  *
- * 0*100 + 1*300 + 2.5*350 + 4.5*250 = 2,300 memberships across 1,000 members.
+ * The bucket totals are asserted by bench-fixtures.test.ts; the arithmetic is
+ * spelled out under the array.
  */
 export const GROUP_COUNT_BUCKETS: readonly { groups: number; members: number }[] = [
   { groups: 0, members: 100 },

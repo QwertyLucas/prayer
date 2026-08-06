@@ -5,10 +5,12 @@ import {
   GROUP_COUNT_BUCKETS,
   GROUP_FIXTURES,
   TAG_NAMES,
+  TIER_TARGET_SIZE,
   expand,
   makeRng,
   pick,
   pickDistinct,
+  pickDistinctWeighted,
 } from './bench-fixtures.js';
 import type { BenchDb } from './bench-schema.js';
 import { newId } from './ids.js';
@@ -93,8 +95,24 @@ export async function loadMembers(db: BenchDb, orgId: string, count: number): Pr
  * actually belongs to.
  *
  * Members are assigned a target group count first, then groups are drawn from
- * the pool. A member with a target of 0 is left alone — those are the isolated
- * members the benchmark needs.
+ * the pool weighted by TIER_TARGET_SIZE. A member with a target of 0 is left
+ * alone — those are the isolated members the benchmark needs.
+ *
+ * Two things about the ordering are load-bearing:
+ *
+ * - The targets are **shuffled** before they are handed out. They come out of
+ *   `expand` in bucket order (all 100 zero-group members first, the 6-group
+ *   members last) and `memberIds` are UUIDv7 in creation order, so assigning
+ *   by position made connectivity a pure function of `users.id` order:
+ *   `SELECT id FROM users ORDER BY id LIMIT 100` returned exactly the isolated
+ *   cohort. Any sampling in Plan 2's oracle or Plan 3's harness would then be
+ *   sampling one connectivity cohort while believing it sampled the
+ *   population. Shuffling reassigns which member gets which target; the bucket
+ *   totals (2,300 memberships, 100 isolated) are untouched.
+ * - The draw is **weighted by tier**, not uniform. Uniform draws gave every
+ *   group ~40 members; the shape the design calls for is a handful of large
+ *   life-stage groups and a long tail of small home groups, because a large
+ *   "hot" audience is what makes per-group selectivity vary at all.
  */
 export async function loadGroups(
   db: BenchDb,
@@ -102,20 +120,36 @@ export async function loadGroups(
   memberIds: readonly string[],
   rng: () => number,
 ): Promise<Map<string, string[]>> {
+  const capacity = GROUP_COUNT_BUCKETS.reduce((a, b) => a + b.members, 0);
+  if (memberIds.length > capacity) {
+    // GROUP_COUNT_BUCKETS is a fixed-size histogram, not a distribution that
+    // scales. Before this check, members past the cap silently took the `?? 0`
+    // fallback and landed in no group at all — a population of 2,000 came out
+    // with 1,100 isolated members instead of 100 and no error anywhere.
+    throw new Error(
+      `GROUP_COUNT_BUCKETS covers ${capacity} members but ${memberIds.length} were requested.\n` +
+        'Every member beyond the cap would silently land in zero groups, inflating the isolated\n' +
+        'cohort and invalidating the whole distribution. Extend GROUP_COUNT_BUCKETS (and the\n' +
+        'counts asserted in bench-fixtures.test.ts) to the population you want.',
+    );
+  }
+
   const groupRows = GROUP_FIXTURES.map((g) => ({ id: newId(), church_id: orgId, name: g.name }));
   await db.insertInto('groups').values(groupRows).execute();
   const groupIds = groupRows.map((g) => g.id);
+  const groupWeights = GROUP_FIXTURES.map((g) => TIER_TARGET_SIZE[g.tier]);
 
   const targets = expand(
     GROUP_COUNT_BUCKETS.map((b) => ({ count: b.members, value: b.groups })),
   ).slice(0, memberIds.length);
+  shuffle(rng, targets);
 
   const byMember = new Map<string, string[]>();
   const membershipRows: { group_id: string; user_id: string; role: 'leader' | 'member' }[] = [];
 
   memberIds.forEach((userId, i) => {
     const target = targets[i] ?? 0;
-    const chosen = target === 0 ? [] : pickDistinct(rng, groupIds, target);
+    const chosen = target === 0 ? [] : pickDistinctWeighted(rng, groupIds, groupWeights, target);
     byMember.set(userId, chosen);
     for (const groupId of chosen) {
       // Roughly one in ten memberships is a leader. Roles govern actions, never visibility.
@@ -135,6 +169,89 @@ export async function loadGroups(
   }
 
   return byMember;
+}
+
+/** How many members get church-scoped privilege. Small, like a real church. */
+export const MODERATOR_COUNT = 20;
+export const SUPER_USER_COUNT = 2;
+/**
+ * At least this many moderators are drawn from the zero-group cohort.
+ *
+ * Rule ② is `author = M OR M ∈ group_members OR user_orgs.role IN
+ * ('moderator','super_user')`. A moderator who is in the targeted group is
+ * visible under the second clause anyway, so they cannot tell whether the role
+ * clause is implemented at all. Only an *isolated* moderator makes the clause
+ * observable — and, symmetrically, makes it observable if a role clause is
+ * wrongly added to rule ③'s sealed tag path, which would be a privacy breach.
+ */
+export const ISOLATED_MODERATOR_COUNT = 2;
+
+export interface PrivilegedRoles {
+  moderators: string[];
+  superUsers: string[];
+}
+
+/**
+ * Promotes a deterministic handful of members to `moderator` / `super_user`.
+ *
+ * Runs after loadGroups because the choice depends on connectivity: without at
+ * least one moderator who belongs to none of the groups a post targets, Plan
+ * 2's differential oracle cannot distinguish "the role clause works" from "the
+ * role clause is missing" — every privileged reader would already be covered by
+ * the membership clause. See ISOLATED_MODERATOR_COUNT.
+ *
+ * These are the church-scoped roles of the `user_role` enum
+ * (`member | moderator | super_user`), NOT the group-scoped
+ * `leader | helper | member` written into `group_members`.
+ *
+ * Counts are clamped to what the population can supply, so degenerate test
+ * populations (N=20, everyone isolated) still load; at N=1000 the pools are
+ * far larger than the counts and the clamp never bites.
+ */
+export async function loadPrivilegedRoles(
+  db: BenchDb,
+  orgId: string,
+  memberIds: readonly string[],
+  groupsByMember: ReadonlyMap<string, readonly string[]>,
+  rng: () => number,
+): Promise<PrivilegedRoles> {
+  const isolated = memberIds.filter((id) => (groupsByMember.get(id) ?? []).length === 0);
+  const connected = memberIds.filter((id) => (groupsByMember.get(id) ?? []).length > 0);
+
+  const isolatedMods = pickDistinct(
+    rng,
+    isolated,
+    Math.min(ISOLATED_MODERATOR_COUNT, isolated.length),
+  );
+  const connectedMods = pickDistinct(
+    rng,
+    connected,
+    Math.min(MODERATOR_COUNT - isolatedMods.length, connected.length),
+  );
+  const moderators = [...isolatedMods, ...connectedMods];
+
+  const taken = new Set(moderators);
+  const rest = memberIds.filter((id) => !taken.has(id));
+  const superUsers = pickDistinct(rng, rest, Math.min(SUPER_USER_COUNT, rest.length));
+
+  if (moderators.length > 0) {
+    await db
+      .updateTable('user_orgs')
+      .set({ role: 'moderator' })
+      .where('org_id', '=', orgId)
+      .where('user_id', 'in', moderators)
+      .execute();
+  }
+  if (superUsers.length > 0) {
+    await db
+      .updateTable('user_orgs')
+      .set({ role: 'super_user' })
+      .where('org_id', '=', orgId)
+      .where('user_id', 'in', superUsers)
+      .execute();
+  }
+
+  return { moderators, superUsers };
 }
 
 /**
@@ -301,12 +418,13 @@ export interface KindAssignment {
  *   being called in loadPrayers' author-major loop, would make audience kind
  *   perfectly correlated with posts.id order — the oldest posts all
  *   church-wide, the newest all group/tag-targeted.
- * - Without the author-order shuffle: `loadGroups` assigns group-count
- *   buckets by *position* in `memberIds` (the 100 zero-group members are
- *   always the first 100), so fallback-heavy authors would cluster at the
- *   front of the creation sequence regardless of kind shuffling, pulling
- *   extra always-compatible kinds toward the posts.id values those members
- *   occupy and reintroducing a smaller but real correlation.
+ * - Without the author-order shuffle: authors would be visited in `memberIds`
+ *   order, so each author's 10 posts occupy a contiguous, predictable block of
+ *   posts.id values. Any property that correlates with a member's position in
+ *   the population — and `loadGroups` shuffles its targets precisely so
+ *   connectivity does not — would leak straight into posts.id order. Shuffling
+ *   the visiting order makes the two independent by construction rather than
+ *   by the good behaviour of an upstream step.
  *
  * Since the production feed orders by posts.id DESC, either correlation
  * alone would explain the "isolated members are slow" signal as an artifact
@@ -526,6 +644,8 @@ export async function loadPrayers(
 export interface BenchSummary {
   orgId: string;
   members: number;
+  moderators: number;
+  superUsers: number;
   groups: number;
   tags: number;
   prayers: number;
@@ -540,34 +660,51 @@ export interface LoadOptions {
   mix?: AudienceMix;
 }
 
-/** Runs the whole load in fixture order. One RNG threads through so the run is reproducible. */
+/**
+ * Runs the whole load in fixture order. One RNG threads through so the run is
+ * reproducible.
+ *
+ * All five write sequences run inside **one transaction**. `loadPrayers` throws
+ * by design when a mix is infeasible, which is exactly what happens the first
+ * time someone tunes a new mix — and without the transaction that left behind
+ * 1 org, 1,000 users, 58 groups and 0 posts. `assertLoadable` then waved the
+ * next run through on its `posts = 0` check, `loadOrg` adopted the leftover
+ * org, and the second run appended another 1,000 members to it: a 2,000-member
+ * church whose printed summary said 1,000 and whose isolated cohort was 200.
+ * Every per-member number would have been silently wrong.
+ */
 export async function loadBenchDataset(db: BenchDb, opts: LoadOptions): Promise<BenchSummary> {
-  const rng = makeRng(opts.seed);
-  const orgId = await loadOrg(db, opts.slug);
-  const members = await loadMembers(db, orgId, opts.members);
-  const groups = await loadGroups(db, orgId, members, rng);
-  const tags = await loadTags(db, orgId, members, rng);
-  // Never 'absorb': a full dataset silently reweighted toward church-wide is
-  // worse than no dataset, because the benchmark would still report numbers.
-  const prayers = await loadPrayers(db, orgId, members, groups, tags, rng, {
-    ...(opts.mix !== undefined ? { mix: opts.mix } : {}),
-    onShortfall: 'throw',
+  return db.transaction().execute(async (trx) => {
+    const rng = makeRng(opts.seed);
+    const orgId = await loadOrg(trx, opts.slug);
+    const members = await loadMembers(trx, orgId, opts.members);
+    const groups = await loadGroups(trx, orgId, members, rng);
+    const roles = await loadPrivilegedRoles(trx, orgId, members, groups, rng);
+    const tags = await loadTags(trx, orgId, members, rng);
+    // Never 'absorb': a full dataset silently reweighted toward church-wide is
+    // worse than no dataset, because the benchmark would still report numbers.
+    const prayers = await loadPrayers(trx, orgId, members, groups, tags, rng, {
+      ...(opts.mix !== undefined ? { mix: opts.mix } : {}),
+      onShortfall: 'throw',
+    });
+
+    const tagCount = [...tags.values()].reduce((a, b) => a + b.length, 0);
+    const audiences = await trx
+      .selectFrom('post_audiences')
+      .innerJoin('posts', 'posts.id', 'post_audiences.post_id')
+      .select(({ fn }) => fn.count<string>('post_audiences.post_id').as('n'))
+      .where('posts.org_id', '=', orgId)
+      .executeTakeFirstOrThrow();
+
+    return {
+      orgId,
+      members: members.length,
+      moderators: roles.moderators.length,
+      superUsers: roles.superUsers.length,
+      groups: GROUP_FIXTURES.length,
+      tags: tagCount,
+      prayers,
+      audiences: Number(audiences.n),
+    };
   });
-
-  const tagCount = [...tags.values()].reduce((a, b) => a + b.length, 0);
-  const audiences = await db
-    .selectFrom('post_audiences')
-    .innerJoin('posts', 'posts.id', 'post_audiences.post_id')
-    .select(({ fn }) => fn.count<string>('post_audiences.post_id').as('n'))
-    .where('posts.org_id', '=', orgId)
-    .executeTakeFirstOrThrow();
-
-  return {
-    orgId,
-    members: members.length,
-    groups: GROUP_FIXTURES.length,
-    tags: tagCount,
-    prayers,
-    audiences: Number(audiences.n),
-  };
 }
