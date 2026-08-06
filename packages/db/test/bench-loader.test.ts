@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { GROUP_FIXTURES, makeRng } from '../src/bench-fixtures.js';
-import { loadGroups, loadMembers, loadOrg, loadTags } from '../src/bench-loader.js';
+import { loadGroups, loadMembers, loadOrg, loadPrayers, loadTags } from '../src/bench-loader.js';
 import { createBenchDb, type BenchDb } from '../src/bench-schema.js';
 
 const url = process.env.TEST_DATABASE_URL as string;
@@ -163,5 +163,103 @@ describe('loadTags', () => {
     for (const names of perOwner.values()) {
       expect(new Set(names).size).toBe(names.length);
     }
+  });
+});
+
+describe('loadPrayers', () => {
+  it('writes 10 prayers per member with a coherent audience mix', async () => {
+    const orgId = await loadOrg(db, 'bench-prayers');
+    const members = await loadMembers(db, orgId, 1000);
+    const rng = makeRng(11);
+    const groups = await loadGroups(db, orgId, members, rng);
+    const tags = await loadTags(db, orgId, members, rng);
+    const written = await loadPrayers(db, orgId, members, groups, tags, rng);
+
+    expect(written).toBe(10000);
+
+    const posts = await db
+      .selectFrom('posts')
+      .select(({ fn }) => fn.count<string>('id').as('n'))
+      .where('org_id', '=', orgId)
+      .executeTakeFirstOrThrow();
+    expect(Number(posts.n)).toBe(10000);
+  });
+
+  it('never targets a tag the author does not own', async () => {
+    const orgId = await loadOrg(db, 'bench-tag-ownership');
+    const members = await loadMembers(db, orgId, 200);
+    const rng = makeRng(12);
+    const groups = await loadGroups(db, orgId, members, rng);
+    const tags = await loadTags(db, orgId, members, rng);
+    await loadPrayers(db, orgId, members, groups, tags, rng);
+
+    const wrong = await db
+      .selectFrom('post_audiences')
+      .innerJoin('posts', 'posts.id', 'post_audiences.post_id')
+      .innerJoin('tags', 'tags.id', 'post_audiences.tag_id')
+      .select('posts.id')
+      .where('posts.org_id', '=', orgId)
+      .whereRef('tags.owner_id', '!=', 'posts.author_id')
+      .execute();
+    expect(wrong).toHaveLength(0);
+  });
+
+  it('never targets a group the author does not belong to', async () => {
+    const orgId = await loadOrg(db, 'bench-group-membership');
+    const members = await loadMembers(db, orgId, 200);
+    const rng = makeRng(13);
+    const groups = await loadGroups(db, orgId, members, rng);
+    const tags = await loadTags(db, orgId, members, rng);
+    await loadPrayers(db, orgId, members, groups, tags, rng);
+
+    const wrong = await db
+      .selectFrom('post_audiences')
+      .innerJoin('posts', 'posts.id', 'post_audiences.post_id')
+      .leftJoin('group_members', (join) =>
+        join
+          .onRef('group_members.group_id', '=', 'post_audiences.group_id')
+          .onRef('group_members.user_id', '=', 'posts.author_id'),
+      )
+      .select('posts.id')
+      .where('posts.org_id', '=', orgId)
+      .where('post_audiences.group_id', 'is not', null)
+      .where('group_members.user_id', 'is', null)
+      .execute();
+    expect(wrong).toHaveLength(0);
+  });
+
+  it('leaves author-only prayers with zero audience rows', async () => {
+    const orgId = await loadOrg(db, 'bench-author-only');
+    const members = await loadMembers(db, orgId, 1000);
+    const rng = makeRng(14);
+    const groups = await loadGroups(db, orgId, members, rng);
+    const tags = await loadTags(db, orgId, members, rng);
+    await loadPrayers(db, orgId, members, groups, tags, rng);
+
+    const orphans = await db
+      .selectFrom('posts')
+      .leftJoin('post_audiences', 'post_audiences.post_id', 'posts.id')
+      .select(({ fn }) => fn.count<string>('posts.id').as('n'))
+      .where('posts.org_id', '=', orgId)
+      .where('post_audiences.post_id', 'is', null)
+      .executeTakeFirstOrThrow();
+    expect(Number(orphans.n)).toBeGreaterThan(0);
+  });
+
+  it('gives every prayer a non-null edit_deadline', async () => {
+    const orgId = await loadOrg(db, 'bench-deadline');
+    const members = await loadMembers(db, orgId, 20);
+    const rng = makeRng(15);
+    const groups = await loadGroups(db, orgId, members, rng);
+    const tags = await loadTags(db, orgId, members, rng);
+    await loadPrayers(db, orgId, members, groups, tags, rng);
+
+    const rows = await db
+      .selectFrom('posts')
+      .select('edit_deadline')
+      .where('org_id', '=', orgId)
+      .limit(5)
+      .execute();
+    for (const r of rows) expect(r.edit_deadline).not.toBeNull();
   });
 });

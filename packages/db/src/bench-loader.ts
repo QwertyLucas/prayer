@@ -1,8 +1,11 @@
 import {
+  AUDIENCE_MIX,
+  type AudienceKind,
   GROUP_COUNT_BUCKETS,
   GROUP_FIXTURES,
   TAG_NAMES,
   expand,
+  pick,
   pickDistinct,
 } from './bench-fixtures.js';
 import type { BenchDb } from './bench-schema.js';
@@ -169,4 +172,127 @@ export async function loadTags(
   }
 
   return byOwner;
+}
+
+interface AudienceRow {
+  post_id: string;
+  church_id: string | null;
+  group_id: string | null;
+  tag_id: string | null;
+}
+
+/**
+ * Ten prayers per member, with audiences drawn from AUDIENCE_MIX.
+ *
+ * Two constraints keep the data coherent, and both matter for the correctness
+ * oracle later: a prayer may only target a tag its author OWNS, and may only
+ * target a group its author BELONGS TO. Members in no groups therefore fall back
+ * to church-wide — which is exactly why they end up with thin feeds.
+ */
+export async function loadPrayers(
+  db: BenchDb,
+  orgId: string,
+  memberIds: readonly string[],
+  groupsByMember: Map<string, string[]>,
+  tagsByOwner: Map<string, string[]>,
+  rng: () => number,
+): Promise<number> {
+  const total = memberIds.length * 10;
+  const scale = total / 10000;
+  const kinds = expand(
+    AUDIENCE_MIX.map((m) => ({ count: Math.max(1, Math.round(m.count * scale)), value: m.kind })),
+  );
+
+  const now = Date.now();
+  const posts: {
+    id: string;
+    org_id: string;
+    parent_id: null;
+    author_id: string;
+    body: string;
+    status: 'published';
+    edit_deadline: Date;
+  }[] = [];
+  const audiences: AudienceRow[] = [];
+
+  let k = 0;
+  for (const authorId of memberIds) {
+    for (let n = 0; n < 10; n++) {
+      const postId = newId();
+      const requested: AudienceKind = kinds[k % kinds.length] ?? 'church';
+      k++;
+
+      const myGroups = groupsByMember.get(authorId) ?? [];
+      const myTags = tagsByOwner.get(authorId) ?? [];
+
+      // Fall back to church-wide when the author has no group to share into.
+      let kind = requested;
+      if ((kind === 'one_group' || kind === 'multi_group') && myGroups.length === 0)
+        kind = 'church';
+      if (kind === 'group_and_tag' && (myGroups.length === 0 || myTags.length === 0))
+        kind = 'church';
+      if ((kind === 'one_tag' || kind === 'multi_tag') && myTags.length === 0) kind = 'church';
+
+      posts.push({
+        id: postId,
+        org_id: orgId,
+        parent_id: null,
+        author_id: authorId,
+        body: `Bench prayer ${n + 1} from ${authorId.slice(0, 8)} (${kind})`,
+        status: 'published',
+        edit_deadline: new Date(now + 24 * 60 * 60 * 1000),
+      });
+
+      const row = (over: Partial<AudienceRow>): AudienceRow => ({
+        post_id: postId,
+        church_id: null,
+        group_id: null,
+        tag_id: null,
+        ...over,
+      });
+
+      switch (kind) {
+        case 'church':
+          audiences.push(row({ church_id: orgId }));
+          break;
+        case 'one_group':
+          audiences.push(row({ group_id: pick(rng, myGroups) }));
+          break;
+        case 'multi_group':
+          for (const g of pickDistinct(rng, myGroups, 2 + Math.floor(rng() * 2))) {
+            audiences.push(row({ group_id: g }));
+          }
+          break;
+        case 'one_tag':
+          audiences.push(row({ tag_id: pick(rng, myTags) }));
+          break;
+        case 'multi_tag':
+          for (const t of pickDistinct(rng, myTags, 2 + Math.floor(rng() * 2))) {
+            audiences.push(row({ tag_id: t }));
+          }
+          break;
+        case 'group_and_tag':
+          audiences.push(row({ group_id: pick(rng, myGroups) }));
+          audiences.push(row({ tag_id: pick(rng, myTags) }));
+          break;
+        case 'author_only':
+          break;
+      }
+    }
+  }
+
+  for (let i = 0; i < posts.length; i += 500) {
+    await db
+      .insertInto('posts')
+      .values(posts.slice(i, i + 500))
+      .execute();
+  }
+  for (let i = 0; i < audiences.length; i += 500) {
+    await db
+      .insertInto('post_audiences')
+      .values(audiences.slice(i, i + 500))
+      .execute();
+  }
+
+  return posts.length;
 }
