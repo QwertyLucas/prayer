@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 import { Pool } from 'pg';
 
-import { migrate } from '../src/migrate.js';
+import { BENCH_MIGRATIONS_DIR, BENCH_MIGRATIONS_TABLE, migrate } from '../src/migrate.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -24,6 +24,12 @@ export async function setup(): Promise<void> {
   await pool.end();
 
   await migrate({ direction: 'up', databaseUrl: testUrl });
+  await migrate({
+    direction: 'up',
+    databaseUrl: testUrl,
+    dir: BENCH_MIGRATIONS_DIR,
+    migrationsTable: BENCH_MIGRATIONS_TABLE,
+  });
 }
 
 export async function teardown(): Promise<void> {
