@@ -145,6 +145,11 @@ meaningful.
 | Home groups    | Home Group 01 … 40                                                                                                                                                                                       |     40 |       26 |       1,050 |
 | **Total**      |                                                                                                                                                                                                          | **58** |          |   **2,300** |
 
+The 2,300 total is exact — it comes from the groups-per-member histogram below. The per-tier
+sizes are targets: `loadGroups` draws groups weighted by tier, so realised sizes land near
+these numbers rather than on them. As loaded (seed 1): life stage min 139 / avg 144 / max
+147, ministry 19 / 28 / 40, home 17 / 27 / 38.
+
 ### Groups per member
 
 | Groups joined | Members | Purpose in the mix                                  |
@@ -154,47 +159,97 @@ meaningful.
 | 2–3           |     350 | Typical: life stage + home group                    |
 | 4–6           |     250 | **The connected member** — leaders on several teams |
 
-The 100 zero-group members are deliberate. A well-connected member's feed is fast —
-Postgres finds 20 visible posts and stops. An isolated member forces a walk back through
-thousands of invisible posts to fill one page. Without them the benchmark reports only
-the easy case.
+The 100 zero-group members are deliberate: they are the least-connected cohort, so if
+group/tag membership affects how far the feed has to walk to fill a page, this is where it
+shows up. Which member gets which connectivity is drawn at random, **not** assigned by
+position in `users.id` order — otherwise `ORDER BY id LIMIT n` would sample one cohort
+while appearing to sample the population.
+
+**Measured, against the loaded datasets.** Rows walked newest-first before 20 visible posts
+have been collected; 50 members sampled per cohort; member rules only (author / church /
+group / tag, no moderator clause):
+
+| Cohort              | `prayer_bench` p50 / p99 | `prayer_bench_stress` p50 / p99 |
+| ------------------- | -----------------------: | ------------------------------: |
+| 0 groups (isolated) |                  46 / 46 |                       215 / 215 |
+| 1 group             |                  46 / 46 |                       159 / 215 |
+| 2–3 groups          |                  39 / 46 |                       137 / 215 |
+| 4+ groups           |                  39 / 46 |                       108 / 202 |
+
+An earlier draft of this section claimed an isolated member "forces a walk back through
+thousands of invisible posts." That is false, at both church-wide shares. The church-wide
+share bounds scan depth for **every** member regardless of connectivity: church-wide posts
+are visible to everyone, so one row in every `total / church` is a hit even for someone in
+no group at all — 10,000/4,000 → ~50 rows in `prayer_bench`, 10,000/1,000 → ~200 in
+`prayer_bench_stress`. Connectivity only ever makes that number smaller.
+
+So at a realistic church-wide share, feed visibility is cheap for everyone, and the
+isolated cohort's cost differs from the connected cohort's by a factor well under two.
+That is a **finding for Plans 2–3 to report, not a dataset defect** — ~1% church-wide would
+widen the spread, but it is not a church. Both datasets stand as they are. The consequence
+for Plan 3 is that scan depth is a weak signal here; the interesting measurement is the
+per-row cost of evaluating the three rules, not the number of rows walked.
 
 ### Tags
 
+Figures are as loaded (seed 1), not design targets — tag count and tag size are both drawn
+per member, so they vary with the seed.
+
 |                    | Value                                                             |
 | ------------------ | ----------------------------------------------------------------- |
-| Tags owned         | 2,000 (avg 2 per member; min 1, max 3)                            |
+| Tags owned         | 1,960 (avg 2 per member; min 1, max 3)                            |
 | Names drawn from   | family, close friends, prayer partners, work, college, neighbours |
-| Members per tag    | 3–12, avg 6                                                       |
-| `tag_members` rows | 12,000                                                            |
+| Members per tag    | 3–12, avg 7.5                                                     |
+| `tag_members` rows | 14,672                                                            |
 
 ### Prayer audience dispersion
+
+The prayer counts are exact — `assignKinds` hits them or throws. The audience-row counts are
+as loaded (seed 1); a "2–3 groups" post picks 2 or 3 at random, so the column varies with the
+seed while the prayer column does not.
 
 | Kind        |    Prayers | audience rows | Exercises                                                                                                                       |
 | ----------- | ---------: | ------------: | ------------------------------------------------------------------------------------------------------------------------------- |
 | Church-wide |      4,000 |         4,000 | Rule ① short-circuit                                                                                                            |
 | One group   |      2,200 |         2,200 | Rule ② single join                                                                                                              |
-| 2–3 groups  |        900 |         2,160 | `group∩group` — must not duplicate rows                                                                                         |
+| 2–3 groups  |        900 |         2,098 | `group∩group` — must not duplicate rows                                                                                         |
 | One tag     |      1,500 |         1,500 | Rule ③ sealed — moderator lockout                                                                                               |
-| 2–3 tags    |        400 |           920 | `tag∩tag` — overlapping personal circles                                                                                        |
-| Group + tag |        800 |         1,760 | `group∩tag` — moderator sees it via the group                                                                                   |
+| 2–3 tags    |        400 |           888 | `tag∩tag` — overlapping personal circles                                                                                        |
+| Group + tag |        800 |         1,600 | `group∩tag` — moderator sees it via the group                                                                                   |
 | Author-only |        200 |             0 | Zero audience rows — a private prayer journal, distinct from `status='draft'`. Asserts a post with no audience leaks to nobody. |
-| **Total**   | **10,000** |    **12,540** |                                                                                                                                 |
+| **Total**   | **10,000** |    **12,286** |                                                                                                                                 |
+
+A second database, `prayer_bench_stress`, holds the same 1,000 members, groups and tags with
+a harsher mix — 1,000 church-wide instead of 4,000, the rest redistributed across the
+group/tag kinds (14,186 audience rows). See `STRESS_AUDIENCE_MIX`.
+
+### Church-scoped roles
+
+20 moderators and 2 super_users, out of 1,000 members. At least two moderators are drawn
+from the zero-group cohort on purpose: rule ②'s privilege clause is only observable through
+a moderator who is _not_ in the targeted group — anyone else is already covered by the
+membership clause. Without them, Plan 2's differential oracle could neither detect the group
+clause being dropped nor, far worse, a privilege clause being wrongly added to rule ③'s
+sealed tag path.
 
 ### Total volume
+
+As loaded into `prayer_bench` (seed 1). `prayer_bench_stress` is identical except for
+`post_audiences`, which is 14,186.
 
 | Table                    |                   Rows |
 | ------------------------ | ---------------------: |
 | orgs                     |                      1 |
 | users                    |                  1,000 |
+| user_orgs                |                  1,000 |
 | groups                   |                     58 |
 | group_members            |                  2,300 |
-| tags                     |                  2,000 |
-| tag_members              |                 12,000 |
+| tags                     |                  1,960 |
+| tag_members              |                 14,672 |
 | posts                    |                 10,000 |
-| post_audiences           |                 12,540 |
-| roles + role_permissions |                    ~15 |
-| **Total**                | **~40,000 (a few MB)** |
+| post_audiences           |                 12,286 |
+| roles + role_permissions |                      8 |
+| **Total**                | **~41,000 (a few MB)** |
 
 ### Storage
 
@@ -208,20 +263,30 @@ data and would compete with it for shared free-tier CPU.
 ### Migrations — bench-only
 
 The six tables do **not** join the main migration sequence. They live in a separate
-`packages/db/bench-migrations/` directory applied only to `prayer_bench`:
+`packages/db/bench-migrations/` directory, tracked in their own `pgmigrations_bench` table
+(`BENCH_MIGRATIONS_TABLE`), applied only to the bench databases and to `prayer_test`:
 
 ```
 packages/db/
-├── migrations/          0001..0029 — prod, unchanged
-└── bench-migrations/    NEW, prayer_bench only
-    ├── b001_groups.sql
-    ├── b002_tags.sql
-    ├── b003_post_audiences.sql
-    └── b004_roles.sql
+├── migrations/          0001..0031 — prod, unchanged
+└── bench-migrations/    NEW, bench databases + prayer_test only
+    ├── b001_roles.sql
+    ├── b002_groups.sql          (groups + group_members)
+    ├── b003_tags.sql            (tags + tag_members)
+    └── b004_post_audiences.sql
 ```
 
-`prayer_dev`, `prayer_test`, and the live Supabase database are untouched. Promoting this
-to production later is a file move plus renumbering into the `0030+` sequence.
+`roles` comes first because `group_members.role` references it.
+
+`prayer_dev` and the live Supabase database are untouched. **`prayer_test` is in scope**:
+`packages/db/test/global-setup.ts` applies the bench migrations to it after the main ones,
+because the loader's integration tests need the tables to exist. That database is dropped
+and re-migrated before every run, so the tables never outlive a test suite. `bench:load`
+itself refuses any database whose name does not contain `bench` (`assertBenchDatabase`), so
+the migrations cannot reach `prayer_dev` by mistyping a URL.
+
+Promoting this to production later is a file move plus renumbering into the `0032+`
+sequence.
 
 **Consequence:** the Kysely schema types in `packages/db/src/schema.ts` must not gain these
 tables either. If they did, code in `@prayer/api` referencing `group_members` would compile

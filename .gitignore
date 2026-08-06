@@ -60,5 +60,8 @@ tmp/
 # git worktrees
 .worktrees/
 
-# Brainstorming visual-companion screens (regenerated per session)
+# Superpowers agent workspace — SDD ledgers, plans, review findings, and the
+# brainstorming visual-companion screens. Working notes about the code rather
+# than the code itself, so they stay local; the decisions that survive get
+# written into docs/ or into the commit message.
 .superpowers/
