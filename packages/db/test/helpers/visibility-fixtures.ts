@@ -25,8 +25,13 @@ export interface VisibilityFixture {
   superUserId: string;
   /** Church moderator who IS also in the group. */
   moderatorInGroupId: string;
-  /** Member of a different church entirely. */
+  /** Member of a different church entirely, and a super_user there — proves a
+   *  privileged role in one org grants nothing in another. */
   foreignerId: string;
+  /** Member of a second, unrelated group — must not see group-audience prayers via it. */
+  decoyGroupMemberId: string;
+  /** Member of a second, unrelated tag — must not see tag-audience prayers via it. */
+  decoyTagMemberId: string;
 
   groupId: string;
   tagId: string;
@@ -72,6 +77,8 @@ export async function buildVisibilityFixture(
   const superUser = person('super-user');
   const moderatorInGroup = person('moderator-in-group');
   const foreigner = person('foreigner');
+  const decoyGroupMember = person('decoy-group-member');
+  const decoyTagMember = person('decoy-tag-member');
 
   await db
     .insertInto('users')
@@ -84,6 +91,8 @@ export async function buildVisibilityFixture(
       superUser,
       moderatorInGroup,
       foreigner,
+      decoyGroupMember,
+      decoyTagMember,
     ])
     .execute();
 
@@ -97,7 +106,12 @@ export async function buildVisibilityFixture(
       { user_id: moderator.id, org_id: orgId, role: 'moderator' },
       { user_id: superUser.id, org_id: orgId, role: 'super_user' },
       { user_id: moderatorInGroup.id, org_id: orgId, role: 'moderator' },
-      { user_id: foreigner.id, org_id: otherOrgId, role: 'member' },
+      // super_user, not plain member: proves the group privilege arm's church
+      // scoping actually matters — a privileged role in another org must grant
+      // nothing here.
+      { user_id: foreigner.id, org_id: otherOrgId, role: 'super_user' },
+      { user_id: decoyGroupMember.id, org_id: orgId, role: 'member' },
+      { user_id: decoyTagMember.id, org_id: orgId, role: 'member' },
     ])
     .execute();
 
@@ -114,6 +128,19 @@ export async function buildVisibilityFixture(
     ])
     .execute();
 
+  // A second, unrelated group. Its only member must never see a prayer
+  // audienced to the fixture's *other* group — this is what pins the
+  // `gm.group_id = a.group_id` join predicate rather than just `user_id`.
+  const decoyGroupId = newId();
+  await db
+    .insertInto('groups')
+    .values({ id: decoyGroupId, church_id: orgId, name: 'Decoy Group' })
+    .execute();
+  await db
+    .insertInto('group_members')
+    .values({ group_id: decoyGroupId, user_id: decoyGroupMember.id, role: 'member' })
+    .execute();
+
   // The author owns the tag but is NOT a member of it — mirrors the real shape
   // and makes the author clause load-bearing rather than decorative.
   const tagId = newId();
@@ -122,6 +149,18 @@ export async function buildVisibilityFixture(
     .values({ id: tagId, owner_id: author.id, church_id: orgId, name: 'fixture tag' })
     .execute();
   await db.insertInto('tag_members').values({ tag_id: tagId, user_id: tagMember.id }).execute();
+
+  // A second, unrelated tag. Its only member must never see a prayer
+  // audienced to the fixture's *other* tag — pins `tm.tag_id = a.tag_id`.
+  const decoyTagId = newId();
+  await db
+    .insertInto('tags')
+    .values({ id: decoyTagId, owner_id: author.id, church_id: orgId, name: 'decoy tag' })
+    .execute();
+  await db
+    .insertInto('tag_members')
+    .values({ tag_id: decoyTagId, user_id: decoyTagMember.id })
+    .execute();
 
   const deadline = new Date(Date.now() + 24 * 60 * 60 * 1000);
   const post = (
@@ -178,6 +217,8 @@ export async function buildVisibilityFixture(
     superUserId: superUser.id,
     moderatorInGroupId: moderatorInGroup.id,
     foreignerId: foreigner.id,
+    decoyGroupMemberId: decoyGroupMember.id,
+    decoyTagMemberId: decoyTagMember.id,
     groupId,
     tagId,
     churchPostId: churchPost.id,

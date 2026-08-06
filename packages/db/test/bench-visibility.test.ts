@@ -68,6 +68,29 @@ describe('canSee — rule ② group', () => {
       rule: 'group',
     });
   });
+
+  it('does not leak to a member of a different, unrelated group', async () => {
+    // Pins the `gm.group_id = a.group_id` join predicate: membership in *a*
+    // group must not satisfy an audience row naming a *different* group.
+    expect(await canSee(db, f.decoyGroupMemberId, f.groupPostId)).toEqual({
+      visible: false,
+      rule: null,
+    });
+    // Nor does membership in an unrelated group say anything about a tag row.
+    expect(await canSee(db, f.decoyGroupMemberId, f.tagPostId)).toEqual({
+      visible: false,
+      rule: null,
+    });
+  });
+
+  it('does not grant privilege to a super_user of a different church', async () => {
+    // Pins the `uo.org_id = p.org_id` guard on the privilege arm: a super_user
+    // role in another org must grant nothing here.
+    expect(await canSee(db, f.foreignerId, f.groupPostId)).toEqual({
+      visible: false,
+      rule: null,
+    });
+  });
 });
 
 describe('canSee — rule ③ tag, sealed', () => {
@@ -86,6 +109,20 @@ describe('canSee — rule ③ tag, sealed', () => {
   it('SEALS it from a super_user who is not in the tag', async () => {
     // The headline privacy property: a super_user gets the same answer as anyone else.
     expect(await canSee(db, f.superUserId, f.tagPostId)).toEqual({ visible: false, rule: null });
+  });
+
+  it('does not leak to a member of a different, unrelated tag', async () => {
+    // Pins the `tm.tag_id = a.tag_id` join predicate: membership in *a* tag
+    // must not satisfy an audience row naming a *different* tag.
+    expect(await canSee(db, f.decoyTagMemberId, f.tagPostId)).toEqual({
+      visible: false,
+      rule: null,
+    });
+    // Nor does membership in an unrelated tag say anything about a group row.
+    expect(await canSee(db, f.decoyTagMemberId, f.groupPostId)).toEqual({
+      visible: false,
+      rule: null,
+    });
   });
 });
 
