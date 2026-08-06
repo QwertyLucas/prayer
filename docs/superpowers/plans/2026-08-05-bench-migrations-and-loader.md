@@ -12,7 +12,7 @@ This is **plan 1 of 3**. It ends with a queryable dataset. Plan 2 adds `apps/ben
 
 ## Global Constraints
 
-- Node 24 required. Use `nvm exec 24 pnpm <cmd>` — pnpm bound to an older Node skips the rolldown native binding and Vitest fails with `MODULE_NOT_FOUND`.
+- Node 24 required. This machine already runs node v24.15.0 and pnpm bound to it — verified with `pnpm exec node --version`. There is no `nvm` on this machine, so use plain `pnpm <cmd>`; `nvm exec 24 pnpm …` fails with `command not found: nvm`. (CLAUDE.md's `nvm exec 24` guidance assumes an nvm install that is not present here.)
 - Relative imports MUST carry `.js` extensions, even though source is `.ts` (`"module": "NodeNext"`).
 - IDs are UUIDv7 via `newId()` from `./ids.js`. They sort lexically in creation order — load-bearing for feed ordering.
 - `exactOptionalPropertyTypes: true` — never pass `{ foo: value | undefined }`. Spread conditionally: `...(v !== undefined ? { foo: v } : {})`.
@@ -102,7 +102,7 @@ describe('bench migrations', () => {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `nvm exec 24 pnpm --filter @prayer/db test bench-migrations`
+Run: `pnpm --filter @prayer/db test bench-migrations`
 Expected: FAIL — `BENCH_MIGRATIONS_DIR` is not exported from `../src/migrate.js`.
 
 - [ ] **Step 3: Implement**
@@ -275,7 +275,7 @@ import { BENCH_MIGRATIONS_DIR, BENCH_MIGRATIONS_TABLE, migrate } from '../src/mi
 
 - [ ] **Step 6: Run the test to verify it passes**
 
-Run: `nvm exec 24 pnpm --filter @prayer/db test bench-migrations`
+Run: `pnpm --filter @prayer/db test bench-migrations`
 Expected: PASS.
 
 - [ ] **Step 7: Add constraint tests**
@@ -316,7 +316,7 @@ it('rejects a group member with an unknown role', async () => {
 
 - [ ] **Step 8: Run the tests**
 
-Run: `nvm exec 24 pnpm --filter @prayer/db test bench-migrations`
+Run: `pnpm --filter @prayer/db test bench-migrations`
 Expected: PASS — 4 tests.
 
 - [ ] **Step 9: Commit**
@@ -417,7 +417,7 @@ export function createBenchDb(connectionString: string): BenchDb {
 
 - [ ] **Step 2: Verify it compiles**
 
-Run: `nvm exec 24 pnpm --filter @prayer/db build`
+Run: `pnpm --filter @prayer/db build`
 Expected: success, no output.
 
 - [ ] **Step 3: Commit**
@@ -525,7 +525,7 @@ describe('bench fixtures', () => {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `nvm exec 24 pnpm --filter @prayer/db test bench-fixtures`
+Run: `pnpm --filter @prayer/db test bench-fixtures`
 Expected: FAIL — cannot resolve `../src/bench-fixtures.js`.
 
 - [ ] **Step 3: Implement**
@@ -665,7 +665,7 @@ export const AUDIENCE_MIX: readonly { kind: AudienceKind; count: number }[] = [
 
 - [ ] **Step 4: Run the test**
 
-Run: `nvm exec 24 pnpm --filter @prayer/db test bench-fixtures`
+Run: `pnpm --filter @prayer/db test bench-fixtures`
 Expected: PASS — 9 tests.
 
 - [ ] **Step 5: Commit**
@@ -748,7 +748,7 @@ describe('loadOrg + loadMembers', () => {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `nvm exec 24 pnpm --filter @prayer/db test bench-loader`
+Run: `pnpm --filter @prayer/db test bench-loader`
 Expected: FAIL — cannot resolve `../src/bench-loader.js`.
 
 - [ ] **Step 3: Implement**
@@ -816,7 +816,7 @@ export async function loadMembers(db: BenchDb, orgId: string, count: number): Pr
 
 - [ ] **Step 4: Run the test**
 
-Run: `nvm exec 24 pnpm --filter @prayer/db test bench-loader`
+Run: `pnpm --filter @prayer/db test bench-loader`
 Expected: PASS — 3 tests.
 
 - [ ] **Step 5: Commit**
@@ -901,7 +901,7 @@ describe('loadGroups', () => {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `nvm exec 24 pnpm --filter @prayer/db test bench-loader`
+Run: `pnpm --filter @prayer/db test bench-loader`
 Expected: FAIL — `loadGroups` is not exported.
 
 - [ ] **Step 3: Implement**
@@ -964,7 +964,7 @@ export async function loadGroups(
 
 - [ ] **Step 4: Run the test**
 
-Run: `nvm exec 24 pnpm --filter @prayer/db test bench-loader`
+Run: `pnpm --filter @prayer/db test bench-loader`
 Expected: PASS — 7 tests.
 
 If the 2,300 assertion fails, the bucket arithmetic in Task 3 is off. Fix `GROUP_COUNT_BUCKETS` — not this test.
@@ -1066,7 +1066,7 @@ describe('loadTags', () => {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `nvm exec 24 pnpm --filter @prayer/db test bench-loader`
+Run: `pnpm --filter @prayer/db test bench-loader`
 Expected: FAIL — `loadTags` is not exported.
 
 - [ ] **Step 3: Implement**
@@ -1133,7 +1133,7 @@ export async function loadTags(
 
 - [ ] **Step 4: Run the test**
 
-Run: `nvm exec 24 pnpm --filter @prayer/db test bench-loader`
+Run: `pnpm --filter @prayer/db test bench-loader`
 Expected: PASS — 11 tests.
 
 - [ ] **Step 5: Commit**
@@ -1267,7 +1267,7 @@ describe('loadPrayers', () => {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `nvm exec 24 pnpm --filter @prayer/db test bench-loader`
+Run: `pnpm --filter @prayer/db test bench-loader`
 Expected: FAIL — `loadPrayers` is not exported.
 
 - [ ] **Step 3: Implement**
@@ -1416,7 +1416,7 @@ export async function loadPrayers(
 
 - [ ] **Step 4: Run the test**
 
-Run: `nvm exec 24 pnpm --filter @prayer/db test bench-loader`
+Run: `pnpm --filter @prayer/db test bench-loader`
 Expected: PASS — 16 tests.
 
 - [ ] **Step 5: Commit**
@@ -1471,7 +1471,7 @@ describe('loadBenchDataset', () => {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `nvm exec 24 pnpm --filter @prayer/db test bench-loader`
+Run: `pnpm --filter @prayer/db test bench-loader`
 Expected: FAIL — `loadBenchDataset` is not exported.
 
 - [ ] **Step 3: Implement the orchestrator**
@@ -1597,7 +1597,7 @@ In `packages/db/package.json`, add to `scripts`:
 
 - [ ] **Step 6: Run the test**
 
-Run: `nvm exec 24 pnpm --filter @prayer/db test bench-loader`
+Run: `pnpm --filter @prayer/db test bench-loader`
 Expected: PASS — 17 tests.
 
 - [ ] **Step 7: Load the real dataset**
@@ -1605,7 +1605,7 @@ Expected: PASS — 17 tests.
 ```bash
 docker exec prayer-postgres psql -U postgres -c "CREATE DATABASE prayer_bench;"
 BENCH_DATABASE_URL=postgres://postgres:postgres@localhost:5432/prayer_bench \
-  nvm exec 24 pnpm --filter @prayer/db bench:load
+  pnpm --filter @prayer/db bench:load
 ```
 
 Expected output: members 1000, groups 58, tags ~2000, prayers 10000, audiences ~12500.
@@ -1638,9 +1638,9 @@ Expected: `0`. Any other number means bench migrations leaked into the app datab
 - [ ] **Step 10: Full check and commit**
 
 ```bash
-nvm exec 24 pnpm --filter @prayer/db test
-nvm exec 24 pnpm --filter @prayer/db build
-nvm exec 24 pnpm format && nvm exec 24 pnpm lint
+pnpm --filter @prayer/db test
+pnpm --filter @prayer/db build
+pnpm format && pnpm lint
 git add packages/db/src/bench-load-cli.ts packages/db/src/bench-loader.ts \
         packages/db/package.json packages/db/test/bench-loader.test.ts
 git commit -m "feat(db): bench:load CLI and dataset summary"
