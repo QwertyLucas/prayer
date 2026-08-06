@@ -19,7 +19,8 @@
     "migrate:down": "node-pg-migrate down -m migrations -j sql --envPath ../../.env",
     "migrate:up:test": "cross-env DATABASE_URL=$TEST_DATABASE_URL node-pg-migrate up -m migrations -j sql --envPath ../../.env",
     "bootstrap": "tsx src/bootstrap.ts",
-    "admin:create-org": "tsx src/admin-create-org.ts"
+    "admin:create-org": "tsx src/admin-create-org.ts",
+    "bench:load": "tsx src/bench-load-cli.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.111.0",

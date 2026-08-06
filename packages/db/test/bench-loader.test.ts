@@ -1,7 +1,21 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { GROUP_FIXTURES, makeRng } from '../src/bench-fixtures.js';
-import { loadGroups, loadMembers, loadOrg, loadPrayers, loadTags } from '../src/bench-loader.js';
+import {
+  AUDIENCE_MIX,
+  type AudienceMix,
+  GROUP_FIXTURES,
+  STRESS_AUDIENCE_MIX,
+  makeRng,
+} from '../src/bench-fixtures.js';
+import {
+  assignKinds,
+  loadBenchDataset,
+  loadGroups,
+  loadMembers,
+  loadOrg,
+  loadPrayers,
+  loadTags,
+} from '../src/bench-loader.js';
 import { createBenchDb, type BenchDb } from '../src/bench-schema.js';
 
 const url = process.env.TEST_DATABASE_URL as string;
@@ -41,6 +55,24 @@ describe('loadOrg + loadMembers', () => {
       .where('user_orgs.org_id', '=', orgId)
       .execute();
     expect(new Set(rows.map((r) => r.email)).size).toBe(10);
+  });
+
+  it('adopts an existing org with the same slug rather than creating a second', async () => {
+    // 0021_add_org_id seeds a default org into every fresh database. The bench
+    // CLI names that org `bench`, so loadOrg has to adopt it — a second org on
+    // one localhost database makes orgContext refuse to resolve (see
+    // apps/api/src/services/orgs.ts#resolveLocalhost) and Plan 2's bench API
+    // would be unusable.
+    const first = await loadOrg(db, 'bench-adopt');
+    const second = await loadOrg(db, 'bench-adopt');
+    expect(second).toBe(first);
+
+    const rows = await db
+      .selectFrom('orgs')
+      .select('id')
+      .where('slug', '=', 'bench-adopt')
+      .execute();
+    expect(rows).toHaveLength(1);
   });
 
   it('returns ids in ascending order so UUIDv7 ordering is preserved', async () => {
@@ -191,7 +223,9 @@ describe('loadPrayers', () => {
     const rng = makeRng(12);
     const groups = await loadGroups(db, orgId, members, rng);
     const tags = await loadTags(db, orgId, members, rng);
-    await loadPrayers(db, orgId, members, groups, tags, rng);
+    // Degenerate population: GROUP_COUNT_BUCKETS gives the first 200 members 0 or
+    // 1 group, so 'multi_group' has no eligible author and the mix cannot be met.
+    await loadPrayers(db, orgId, members, groups, tags, rng, { onShortfall: 'absorb' });
 
     const wrong = await db
       .selectFrom('post_audiences')
@@ -210,7 +244,9 @@ describe('loadPrayers', () => {
     const rng = makeRng(13);
     const groups = await loadGroups(db, orgId, members, rng);
     const tags = await loadTags(db, orgId, members, rng);
-    await loadPrayers(db, orgId, members, groups, tags, rng);
+    // Degenerate population: at N=200 no author belongs to two groups, so
+    // 'multi_group' is infeasible — see the tag-ownership test above.
+    await loadPrayers(db, orgId, members, groups, tags, rng, { onShortfall: 'absorb' });
 
     const wrong = await db
       .selectFrom('post_audiences')
@@ -252,7 +288,9 @@ describe('loadPrayers', () => {
     const rng = makeRng(15);
     const groups = await loadGroups(db, orgId, members, rng);
     const tags = await loadTags(db, orgId, members, rng);
-    await loadPrayers(db, orgId, members, groups, tags, rng);
+    // Degenerate population: at N=20 every member is in the zero-group bucket,
+    // so no group-requiring kind can be produced at all.
+    await loadPrayers(db, orgId, members, groups, tags, rng, { onShortfall: 'absorb' });
 
     const rows = await db
       .selectFrom('posts')
@@ -363,5 +401,108 @@ describe('loadPrayers', () => {
       .execute();
     expect(tagRows.length).toBeGreaterThan(0);
     for (const r of tagRows) expect(Number(r.n)).toBeGreaterThanOrEqual(2);
+  });
+
+  it('writes the stress mix end to end when one is passed', async () => {
+    const orgId = await loadOrg(db, 'bench-stress-mix');
+    const members = await loadMembers(db, orgId, 1000);
+    const rng = makeRng(19);
+    const groups = await loadGroups(db, orgId, members, rng);
+    const tags = await loadTags(db, orgId, members, rng);
+    await loadPrayers(db, orgId, members, groups, tags, rng, { mix: STRESS_AUDIENCE_MIX });
+
+    const rows = await db.selectFrom('posts').select('body').where('org_id', '=', orgId).execute();
+    const counts: Record<string, number> = {};
+    for (const r of rows) {
+      const kind = r.body.match(/\(([a-z_]+)\)$/)?.[1] ?? 'unknown';
+      counts[kind] = (counts[kind] ?? 0) + 1;
+    }
+    expect(counts).toEqual(Object.fromEntries(STRESS_AUDIENCE_MIX.map((m) => [m.kind, m.count])));
+  });
+
+  it('throws on a shortfall instead of letting church quietly absorb it', async () => {
+    const orgId = await loadOrg(db, 'bench-shortfall');
+    const members = await loadMembers(db, orgId, 20);
+    const rng = makeRng(20);
+    const groups = await loadGroups(db, orgId, members, rng);
+    const tags = await loadTags(db, orgId, members, rng);
+
+    // At N=20 every member sits in the zero-group bucket, so every
+    // group-requiring kind is infeasible. Silently reweighting toward
+    // church-wide is precisely the distortion the guard exists to catch.
+    await expect(loadPrayers(db, orgId, members, groups, tags, rng)).rejects.toThrow(
+      /multi_group: requested \d+, assigned 0/,
+    );
+
+    // The guard fires before anything is inserted, so no partial dataset is left behind.
+    const posts = await db
+      .selectFrom('posts')
+      .select(({ fn }) => fn.count<string>('id').as('n'))
+      .where('org_id', '=', orgId)
+      .executeTakeFirstOrThrow();
+    expect(Number(posts.n)).toBe(0);
+  });
+});
+
+describe('assignKinds feasibility at N=1000', () => {
+  it('hits exact per-kind counts for both mixes across 20 seeds', async () => {
+    // The assignment is pure, so the expensive part (real group/tag maps) is
+    // built once per population and reused across every seed and both mixes.
+    // Two populations because tag counts (1-3 per member) are rng-driven, while
+    // group counts are fixed by position in GROUP_COUNT_BUCKETS.
+    const populations = [];
+    for (const seed of [101, 202]) {
+      const orgId = await loadOrg(db, `bench-feasibility-${seed}`);
+      const members = await loadMembers(db, orgId, 1000);
+      const rng = makeRng(seed);
+      const groups = await loadGroups(db, orgId, members, rng);
+      const tags = await loadTags(db, orgId, members, rng);
+      populations.push({ orgId, members, groups, tags });
+    }
+
+    const mixes: { name: string; mix: AudienceMix }[] = [
+      { name: 'realistic', mix: AUDIENCE_MIX },
+      { name: 'stress', mix: STRESS_AUDIENCE_MIX },
+    ];
+
+    for (const { name, mix } of mixes) {
+      const want = Object.fromEntries(mix.map((m) => [m.kind, m.count]));
+      for (const pop of populations) {
+        for (let seed = 1; seed <= 20; seed++) {
+          const { kindsByAuthor } = assignKinds(pop.members, pop.groups, pop.tags, makeRng(seed), {
+            mix,
+          });
+          const counts: Record<string, number> = {};
+          for (const kinds of kindsByAuthor.values()) {
+            expect(kinds).toHaveLength(10);
+            for (const k of kinds) counts[k] = (counts[k] ?? 0) + 1;
+          }
+          expect(counts, `${name} mix, population ${pop.orgId}, seed ${seed}`).toEqual(want);
+        }
+      }
+    }
+  });
+});
+
+describe('loadBenchDataset', () => {
+  // N=1000, not a smaller population: loadBenchDataset always demands an exactly
+  // fulfilled mix (onShortfall: 'throw'), and GROUP_COUNT_BUCKETS makes every
+  // group-requiring kind infeasible below N=300.
+  it('reports a summary matching what it wrote', async () => {
+    const summary = await loadBenchDataset(db, { slug: 'bench-full', members: 1000, seed: 21 });
+
+    expect(summary.members).toBe(1000);
+    expect(summary.groups).toBe(58);
+    expect(summary.prayers).toBe(10000);
+    expect(summary.tags).toBeGreaterThanOrEqual(1000);
+    expect(summary.audiences).toBeGreaterThan(0);
+
+    const actual = await db
+      .selectFrom('post_audiences')
+      .innerJoin('posts', 'posts.id', 'post_audiences.post_id')
+      .select(({ fn }) => fn.count<string>('post_audiences.post_id').as('n'))
+      .where('posts.org_id', '=', summary.orgId)
+      .executeTakeFirstOrThrow();
+    expect(Number(actual.n)).toBe(summary.audiences);
   });
 });

@@ -116,13 +116,43 @@ export const GROUP_COUNT_BUCKETS: readonly { groups: number; members: number }[]
 // members:     100 + 300 + 175 + 175 + 130 + 115 +  5 = 1,000
 // memberships:   0 + 300 + 350 + 525 + 520 + 575 + 30 = 2,300
 
-/** 10,000 prayers. Church-wide is a superset, so it never combines with a group or tag. */
-export const AUDIENCE_MIX: readonly { kind: AudienceKind; count: number }[] = [
+/** How many of the 10,000 prayers each audience kind gets. */
+export type AudienceMix = readonly { kind: AudienceKind; count: number }[];
+
+/**
+ * The realistic mix: 10,000 prayers shaped like a real church feed, where most
+ * requests go to the whole congregation. Church-wide is a superset, so it never
+ * combines with a group or tag.
+ */
+export const AUDIENCE_MIX: AudienceMix = [
   { kind: 'church', count: 4000 },
   { kind: 'one_group', count: 2200 },
   { kind: 'multi_group', count: 900 },
   { kind: 'one_tag', count: 1500 },
   { kind: 'multi_tag', count: 400 },
   { kind: 'group_and_tag', count: 800 },
+  { kind: 'author_only', count: 200 },
+];
+
+/**
+ * Stress variant: ~10% church-wide instead of 40%. A member's feed can no longer be
+ * filled from the church-wide firehose, so filling one 20-post page forces a real walk
+ * through group/tag audiences — which is the cost the benchmark exists to measure.
+ * Still 10,000 prayers.
+ *
+ * The counts are chosen to stay feasible at N=1000 under GROUP_COUNT_BUCKETS: the
+ * group-requiring kinds (2800 + 1600 + 1000 = 5,400 slots) sit well under the 9,000
+ * slots held by the 900 members in at least one group, and multi_group's 1,600 sits
+ * under the 6,000 slots held by the 600 members in 2+ groups. Feasibility is asserted
+ * per seed by the assignKinds sweep in bench-loader.test.ts — loadPrayers throws
+ * rather than let 'church' absorb an unfillable kind.
+ */
+export const STRESS_AUDIENCE_MIX: AudienceMix = [
+  { kind: 'church', count: 1000 },
+  { kind: 'one_group', count: 2800 },
+  { kind: 'multi_group', count: 1600 },
+  { kind: 'one_tag', count: 2400 },
+  { kind: 'multi_tag', count: 1000 },
+  { kind: 'group_and_tag', count: 1000 },
   { kind: 'author_only', count: 200 },
 ];

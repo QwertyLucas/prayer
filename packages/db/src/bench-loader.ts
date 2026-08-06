@@ -1,10 +1,12 @@
 import {
   AUDIENCE_MIX,
   type AudienceKind,
+  type AudienceMix,
   GROUP_COUNT_BUCKETS,
   GROUP_FIXTURES,
   TAG_NAMES,
   expand,
+  makeRng,
   pick,
   pickDistinct,
 } from './bench-fixtures.js';
@@ -18,8 +20,23 @@ import { newId } from './ids.js';
  * bootstrap.ts — do not "fix" this by routing through services.
  */
 
-/** Creates the benchmark church. The slug is arbitrary; nothing resolves it by hostname. */
+/**
+ * Finds or creates the benchmark church.
+ *
+ * Find-or-create, not create: migration 0021_add_org_id seeds a default org into
+ * every fresh database, and `bench-load-cli.ts` names that org `bench` so the
+ * bench database holds exactly one. A second org makes `resolveLocalhost`
+ * (apps/api/src/services/orgs.ts) refuse to resolve any org at all, which would
+ * make the bench API unusable against a localhost database.
+ */
 export async function loadOrg(db: BenchDb, slug: string): Promise<string> {
+  const existing = await db
+    .selectFrom('orgs')
+    .select('id')
+    .where('slug', '=', slug)
+    .executeTakeFirst();
+  if (existing) return existing.id;
+
   const id = newId();
   await db
     .insertInto('orgs')
@@ -235,10 +252,11 @@ function shuffle<T>(rng: () => number, xs: T[]): void {
  *
  * Assigning the tightest kinds first — before anything less picky has had a
  * chance to consume their only eligible slots — avoids that. 'church' goes
- * last and, uniquely, is NOT capped at its AUDIENCE_MIX count: it absorbs
- * every slot still open once the rest are placed, so every author ends up
- * with exactly 10 assigned kinds even if an earlier kind's eligible pool ran
- * short (only possible at small test populations — see loadPrayers' doc).
+ * last and, uniquely, is NOT capped at its quota: it absorbs every slot still
+ * open once the rest are placed, so every author ends up with exactly 10
+ * assigned kinds even if an earlier kind's eligible pool ran short. That
+ * absorption is a distortion, not a feature, so assignKinds throws when it
+ * happens unless the caller opts out.
  */
 const ASSIGNMENT_ORDER: readonly AudienceKind[] = [
   'multi_group',
@@ -250,22 +268,39 @@ const ASSIGNMENT_ORDER: readonly AudienceKind[] = [
   'church',
 ];
 
+export interface LoadPrayersOptions {
+  /** Audience distribution to hit. Defaults to AUDIENCE_MIX (the realistic shape). */
+  mix?: AudienceMix;
+  /**
+   * What to do when a kind's eligible author pool is too small to meet its
+   * quota. 'throw' (the default) refuses to write a distorted dataset;
+   * 'absorb' lets 'church' take the unfilled slots, which is only appropriate
+   * for the deliberately degenerate populations used in referential-coherence
+   * tests.
+   */
+  onShortfall?: 'throw' | 'absorb';
+}
+
+export interface KindAssignment {
+  /** Authors in shuffled order. Posts are created in this order. */
+  authors: string[];
+  /** Author id -> exactly 10 audience kinds, themselves shuffled. */
+  kindsByAuthor: Map<string, AudienceKind[]>;
+}
+
 /**
- * Ten prayers per member, with audiences drawn from AUDIENCE_MIX.
+ * Decides which audience kind each of an author's 10 prayers gets, hitting the
+ * mix's per-kind counts exactly. Pure — no database, no clock — so the
+ * feasibility of a mix can be swept across many seeds cheaply.
  *
- * Two constraints keep the data coherent, and both matter for the correctness
- * oracle later: a prayer may only target a tag its author OWNS, and may only
- * target a group its author BELONGS TO. Members in no groups therefore fall back
- * to church-wide — which is exactly why they end up with thin feeds.
+ * Assignment happens in two decorrelated random steps — see ASSIGNMENT_ORDER's
+ * doc for why a naive single pass isn't exact — and the author-visiting order
+ * is shuffled too:
  *
- * Kind assignment happens in two decorrelated random steps — see
- * ASSIGNMENT_ORDER's doc for why a naive single pass isn't exact — and the
- * author-visiting order is shuffled too:
- *
- * - Without the kind shuffle: AUDIENCE_MIX's fixed bucket order, plus
- *   `newId()` being called in this same author-major loop, would make
- *   audience kind perfectly correlated with posts.id order — the oldest
- *   posts all church-wide, the newest all group/tag-targeted.
+ * - Without the kind shuffle: the mix's fixed bucket order, plus `newId()`
+ *   being called in loadPrayers' author-major loop, would make audience kind
+ *   perfectly correlated with posts.id order — the oldest posts all
+ *   church-wide, the newest all group/tag-targeted.
  * - Without the author-order shuffle: `loadGroups` assigns group-count
  *   buckets by *position* in `memberIds` (the 100 zero-group members are
  *   always the first 100), so fallback-heavy authors would cluster at the
@@ -278,25 +313,33 @@ const ASSIGNMENT_ORDER: readonly AudienceKind[] = [
  * of insert order rather than of visibility — which is exactly what the
  * benchmark exists to measure honestly.
  */
-export async function loadPrayers(
-  db: BenchDb,
-  orgId: string,
+export function assignKinds(
   memberIds: readonly string[],
-  groupsByMember: Map<string, string[]>,
-  tagsByOwner: Map<string, string[]>,
+  groupsByMember: ReadonlyMap<string, readonly string[]>,
+  tagsByOwner: ReadonlyMap<string, readonly string[]>,
   rng: () => number,
-): Promise<number> {
+  opts: LoadPrayersOptions = {},
+): KindAssignment {
+  const mix = opts.mix ?? AUDIENCE_MIX;
+  const onShortfall = opts.onShortfall ?? 'throw';
+
   const total = memberIds.length * 10;
-  const scale = total / 10000;
-  const need = new Map<AudienceKind, number>(
-    AUDIENCE_MIX.map((m) => [m.kind, Math.max(1, Math.round(m.count * scale))]),
+  const scale = total / mix.reduce((a, m) => a + m.count, 0);
+  // Capped kinds get their scaled share. 'church' is the residual bucket, so
+  // its quota is whatever the capped kinds leave rather than a rounded share —
+  // that keeps the quotas summing to exactly `total` at any population size.
+  const quota = new Map<AudienceKind, number>(
+    mix
+      .filter((m) => m.kind !== 'church')
+      .map((m) => [m.kind, Math.max(1, Math.round(m.count * scale))]),
   );
+  const churchQuota = total - [...quota.values()].reduce((a, b) => a + b, 0);
 
   const authors = [...memberIds];
   shuffle(rng, authors);
 
   const remainingSlots = new Map(authors.map((id) => [id, 10]));
-  const assignedKinds = new Map<string, AudienceKind[]>(authors.map((id) => [id, []]));
+  const kindsByAuthor = new Map<string, AudienceKind[]>(authors.map((id) => [id, []]));
 
   for (const kind of ASSIGNMENT_ORDER) {
     // One "ticket" per still-open slot on an author this kind is compatible
@@ -314,21 +357,87 @@ export async function loadPrayers(
     shuffle(rng, tickets);
 
     // 'church' is the residual bucket (see ASSIGNMENT_ORDER doc): it takes
-    // every remaining ticket instead of stopping at its AUDIENCE_MIX count.
-    const take = kind === 'church' ? tickets.length : Math.min(need.get(kind) ?? 0, tickets.length);
+    // every remaining ticket instead of stopping at its quota.
+    const take =
+      kind === 'church' ? tickets.length : Math.min(quota.get(kind) ?? 0, tickets.length);
     for (let i = 0; i < take; i++) {
       const authorId = tickets[i];
       if (authorId === undefined) continue;
       remainingSlots.set(authorId, (remainingSlots.get(authorId) ?? 0) - 1);
-      assignedKinds.get(authorId)?.push(kind);
+      kindsByAuthor.get(authorId)?.push(kind);
     }
   }
+
+  if (onShortfall === 'throw') assertNoShortfall(total, quota, churchQuota, kindsByAuthor);
 
   // Every author's own 10 kinds were appended in ASSIGNMENT_ORDER (tightest
   // kinds first, 'church' last) — shuffle each author's list so that order
   // doesn't leak into posts.id order at the fine-grained, single-author-block
   // scale the way the unshuffled ASSIGNMENT_ORDER would.
-  for (const kinds of assignedKinds.values()) shuffle(rng, kinds);
+  for (const kinds of kindsByAuthor.values()) shuffle(rng, kinds);
+
+  return { authors, kindsByAuthor };
+}
+
+/**
+ * Refuses a mix the population cannot actually deliver.
+ *
+ * A short kind is invisible without this check: 'church' is uncapped, so it
+ * quietly swallows every slot the short kind could not claim and the dataset
+ * comes out reweighted toward church-wide visibility — the exact distortion
+ * the benchmark exists to avoid measuring.
+ */
+function assertNoShortfall(
+  total: number,
+  quota: ReadonlyMap<AudienceKind, number>,
+  churchQuota: number,
+  kindsByAuthor: ReadonlyMap<string, readonly AudienceKind[]>,
+): void {
+  const assigned = new Map<AudienceKind, number>();
+  for (const kinds of kindsByAuthor.values()) {
+    for (const kind of kinds) assigned.set(kind, (assigned.get(kind) ?? 0) + 1);
+  }
+
+  const short = [...quota].filter(([kind, want]) => (assigned.get(kind) ?? 0) !== want);
+  if (short.length === 0) return;
+
+  const churchAssigned = assigned.get('church') ?? 0;
+  const lines = short.map(
+    ([kind, want]) => `  ${kind}: requested ${want}, assigned ${assigned.get(kind) ?? 0}`,
+  );
+  throw new Error(
+    `The benchmark audience mix is infeasible for this population ` +
+      `(${kindsByAuthor.size} members, ${total} prayers).\n` +
+      `${lines.join('\n')}\n` +
+      `  church absorbed ${churchAssigned - churchQuota} unfilled slot(s) ` +
+      `(requested ${churchQuota}, assigned ${churchAssigned}), which would silently\n` +
+      `  reweight the dataset toward church-wide visibility.\n` +
+      `  Fix the mix, grow the population, or pass { onShortfall: 'absorb' } if this\n` +
+      `  population is degenerate on purpose.`,
+  );
+}
+
+/**
+ * Ten prayers per member, with audiences drawn from the given mix.
+ *
+ * Two constraints keep the data coherent, and both matter for the correctness
+ * oracle later: a prayer may only target a tag its author OWNS, and may only
+ * target a group its author BELONGS TO. Members in no groups therefore fall back
+ * to church-wide — which is exactly why they end up with thin feeds.
+ *
+ * Which kind each prayer gets — and why the ordering is shuffled twice — is
+ * assignKinds' job; see its doc.
+ */
+export async function loadPrayers(
+  db: BenchDb,
+  orgId: string,
+  memberIds: readonly string[],
+  groupsByMember: Map<string, string[]>,
+  tagsByOwner: Map<string, string[]>,
+  rng: () => number,
+  opts: LoadPrayersOptions = {},
+): Promise<number> {
+  const { authors, kindsByAuthor } = assignKinds(memberIds, groupsByMember, tagsByOwner, rng, opts);
 
   const now = Date.now();
   const posts: {
@@ -345,7 +454,7 @@ export async function loadPrayers(
   for (const authorId of authors) {
     const myGroups = groupsByMember.get(authorId) ?? [];
     const myTags = tagsByOwner.get(authorId) ?? [];
-    const kindsForAuthor = assignedKinds.get(authorId) ?? [];
+    const kindsForAuthor = kindsByAuthor.get(authorId) ?? [];
 
     kindsForAuthor.forEach((kind, n) => {
       const postId = newId();
@@ -412,4 +521,53 @@ export async function loadPrayers(
   }
 
   return posts.length;
+}
+
+export interface BenchSummary {
+  orgId: string;
+  members: number;
+  groups: number;
+  tags: number;
+  prayers: number;
+  audiences: number;
+}
+
+export interface LoadOptions {
+  slug: string;
+  members: number;
+  seed: number;
+  /** Audience distribution. Defaults to AUDIENCE_MIX (the realistic shape). */
+  mix?: AudienceMix;
+}
+
+/** Runs the whole load in fixture order. One RNG threads through so the run is reproducible. */
+export async function loadBenchDataset(db: BenchDb, opts: LoadOptions): Promise<BenchSummary> {
+  const rng = makeRng(opts.seed);
+  const orgId = await loadOrg(db, opts.slug);
+  const members = await loadMembers(db, orgId, opts.members);
+  const groups = await loadGroups(db, orgId, members, rng);
+  const tags = await loadTags(db, orgId, members, rng);
+  // Never 'absorb': a full dataset silently reweighted toward church-wide is
+  // worse than no dataset, because the benchmark would still report numbers.
+  const prayers = await loadPrayers(db, orgId, members, groups, tags, rng, {
+    ...(opts.mix !== undefined ? { mix: opts.mix } : {}),
+    onShortfall: 'throw',
+  });
+
+  const tagCount = [...tags.values()].reduce((a, b) => a + b.length, 0);
+  const audiences = await db
+    .selectFrom('post_audiences')
+    .innerJoin('posts', 'posts.id', 'post_audiences.post_id')
+    .select(({ fn }) => fn.count<string>('post_audiences.post_id').as('n'))
+    .where('posts.org_id', '=', orgId)
+    .executeTakeFirstOrThrow();
+
+  return {
+    orgId,
+    members: members.length,
+    groups: GROUP_FIXTURES.length,
+    tags: tagCount,
+    prayers,
+    audiences: Number(audiences.n),
+  };
 }
