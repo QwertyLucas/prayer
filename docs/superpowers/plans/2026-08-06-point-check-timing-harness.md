@@ -437,7 +437,7 @@ Expected: FAIL — cannot resolve `../src/bench-visibility.js`.
 Create `packages/db/src/bench-visibility.ts`:
 
 ```ts
-import { sql } from 'kysely';
+import { sql, type RawBuilder } from 'kysely';
 
 import type { BenchDb } from './bench-schema.js';
 
@@ -450,7 +450,7 @@ export interface CanSeeResult {
   rule: VisibilityRule | null;
 }
 
-interface ClauseRow {
+export interface ClauseRow {
   by_author: boolean;
   by_church: boolean;
   by_group: boolean;
@@ -476,7 +476,31 @@ interface ClauseRow {
  * error rather than as a plausible-looking `visible: false`.
  */
 export async function canSee(db: BenchDb, viewerId: string, postId: string): Promise<CanSeeResult> {
-  const result = await sql<ClauseRow>`
+  const result = await visibilityClausesSql(viewerId, postId).execute(db);
+
+  const row = result.rows[0];
+  if (row === undefined) throw new Error(`canSee: no prayer with id ${postId}`);
+
+  // Most specific truth first: a viewer who is both a group member and a
+  // moderator is reported as a member, because they would see it either way.
+  if (row.by_author) return { visible: true, rule: 'author' };
+  if (row.by_church) return { visible: true, rule: 'church' };
+  if (row.by_group) return { visible: true, rule: 'group' };
+  if (row.by_group_moderator) return { visible: true, rule: 'group_moderator' };
+  if (row.by_tag) return { visible: true, rule: 'tag' };
+  return { visible: false, rule: null };
+}
+
+/**
+ * The statement `canSee` runs, as a reusable fragment.
+ *
+ * Exported so the timing harness can wrap this EXACT statement in EXPLAIN
+ * ANALYZE. A corroboration pass that explains a paraphrase of the query
+ * corroborates nothing, and copying the SQL to a second call site would let the
+ * two drift apart silently.
+ */
+export function visibilityClausesSql(viewerId: string, postId: string): RawBuilder<ClauseRow> {
+  return sql<ClauseRow>`
     SELECT
       (p.author_id = ${viewerId}) AS by_author,
 
@@ -517,19 +541,7 @@ export async function canSee(db: BenchDb, viewerId: string, postId: string): Pro
 
       FROM posts p
      WHERE p.id = ${postId}
-  `.execute(db);
-
-  const row = result.rows[0];
-  if (row === undefined) throw new Error(`canSee: no prayer with id ${postId}`);
-
-  // Most specific truth first: a viewer who is both a group member and a
-  // moderator is reported as a member, because they would see it either way.
-  if (row.by_author) return { visible: true, rule: 'author' };
-  if (row.by_church) return { visible: true, rule: 'church' };
-  if (row.by_group) return { visible: true, rule: 'group' };
-  if (row.by_group_moderator) return { visible: true, rule: 'group_moderator' };
-  if (row.by_tag) return { visible: true, rule: 'tag' };
-  return { visible: false, rule: null };
+  `;
 }
 ```
 
@@ -1243,11 +1255,12 @@ describe('runPointCheckTiming', () => {
     expect(c.explainMeanMs ?? 0).toBeGreaterThan(0);
   });
 
-  it('measures the floor on the same connection as the check', async () => {
+  it('runs every timed query on one pinned Postgres backend', async () => {
     // A pg.Pool may hand consecutive queries to different backends, which would
-    // make the floor meaningless. The runner pins one connection; if it stops
-    // doing so, floor and check would be sampling different backends and this
-    // assertion on a settled, single-connection run gets flaky.
+    // make the floor meaningless — it is only comparable as the round-trip cost
+    // of the SAME connection the check used. The runner records the backend pid
+    // and throws if it changed mid-run, so this is a proof rather than a
+    // heuristic about timing spread.
     const run = await runPointCheckTiming(db, {
       orgId: f.orgId,
       samples: 40,
@@ -1255,12 +1268,8 @@ describe('runPointCheckTiming', () => {
       warmup: 20,
       databaseName: 'prayer_test',
     });
-    const floors = run.samples.map((s) => s.floorNs).sort((a, b) => a - b);
-    const median = floors[Math.floor(floors.length / 2)] ?? 0;
-    expect(median).toBeGreaterThan(0);
-    // A pinned, warmed connection's floor is tight. Two different backends —
-    // one warm, one cold — would blow the spread far past this.
-    expect(floors[floors.length - 1] ?? 0).toBeLessThan(median * 50);
+    expect(run.conditions.backendPid).not.toBeNull();
+    expect(run.conditions.backendPid ?? 0).toBeGreaterThan(0);
   });
 
   it('is deterministic in which pairs it draws, for a fixed seed', async () => {
@@ -1340,7 +1349,7 @@ import {
   type PostFacts,
   type ViewerFacts,
 } from './bench-visibility-reference.js';
-import { canSee, type VisibilityRule } from './bench-visibility.js';
+import { canSee, visibilityClausesSql, type VisibilityRule } from './bench-visibility.js';
 
 export interface TimingOptions {
   orgId: string;
@@ -1388,6 +1397,8 @@ export interface RunConditions {
   gitDirty: boolean | null;
   /** EXPLAIN ANALYZE corroboration over a subsample. Inflated by instrumentation; not the headline. */
   explainMeanMs: number | null;
+  /** The single Postgres backend every timed query ran on. Proves the floor is comparable. */
+  backendPid: number | null;
 }
 
 export interface TimingRun {
@@ -1415,20 +1426,21 @@ async function explainSubsample(db: BenchDb, samples: TimedSample[]): Promise<nu
   if (samples.length === 0) return null;
   const times: number[] = [];
   for (const s of samples) {
+    // Explains the EXACT statement canSee runs, not a paraphrase of it.
     const explained = await sql<ExplainRow>`
-      EXPLAIN (ANALYZE, TIMING ON, FORMAT JSON)
-      SELECT EXISTS (
-        SELECT 1
-          FROM post_audiences a
-          JOIN user_orgs uo ON uo.org_id = a.church_id AND uo.user_id = ${s.viewerId}
-         WHERE a.post_id = ${s.postId}
-      )
+      EXPLAIN (ANALYZE, TIMING ON, FORMAT JSON) ${visibilityClausesSql(s.viewerId, s.postId)}
     `.execute(db);
     const plan = explained.rows[0]?.['QUERY PLAN'][0];
     if (plan !== undefined) times.push(plan['Execution Time']);
   }
   if (times.length === 0) return null;
   return times.reduce((a, b) => a + b, 0) / times.length;
+}
+
+/** The Postgres backend serving this connection. Used to prove the connection was pinned. */
+async function backendPid(db: BenchDb): Promise<number> {
+  const row = await sql<{ pid: number }>`SELECT pg_backend_pid() AS pid`.execute(db);
+  return Number(row.rows[0]?.pid ?? 0);
 }
 
 function gitInfo(): { commit: string | null; dirty: boolean | null } {
@@ -1527,6 +1539,7 @@ export async function runPointCheckTiming(db: BenchDb, opts: TimingOptions): Pro
   const samples: TimedSample[] = [];
   const disagreements: string[] = [];
   let explainMeanMs: number | null = null;
+  let backendPidUsed: number | null = null;
 
   // EVERY timed query runs on ONE pinned connection. `createBenchDb` builds a
   // pg.Pool, and a pool is free to hand consecutive queries to different
@@ -1534,6 +1547,8 @@ export async function runPointCheckTiming(db: BenchDb, opts: TimingOptions): Pro
   // meaningful as the round-trip cost of the SAME connection the check used.
   // `db.connection()` pins one for the whole callback.
   await db.connection().execute(async (conn) => {
+    const pidBefore = await backendPid(conn);
+
     // Warmup: discarded. Settles plan caching and connection setup.
     for (let i = 0; i < opts.warmup; i++) {
       const pair = pairs[i];
@@ -1582,6 +1597,19 @@ export async function runPointCheckTiming(db: BenchDb, opts: TimingOptions): Pro
     // ANALYZE inflates what it measures, so this is corroboration that the
     // marginal figure is the right order of magnitude — not a second estimate.
     explainMeanMs = await explainSubsample(conn, samples.slice(0, EXPLAIN_SUBSAMPLE));
+
+    // Proof, not assumption. If the pool handed us a different backend part way
+    // through, every floor measurement is against a connection the check never
+    // used, and the marginal figure is meaningless. Verified rather than
+    // trusted, because a silently wrong benchmark is the failure mode here.
+    const pidAfter = await backendPid(conn);
+    if (pidBefore !== pidAfter) {
+      throw new Error(
+        `runPointCheckTiming: the connection changed mid-run (backend ${pidBefore} → ${pidAfter}). ` +
+          'The round-trip floor is only meaningful on the same connection as the check.',
+      );
+    }
+    backendPidUsed = pidBefore;
   });
 
   if (disagreements.length > 0) {
@@ -1625,6 +1653,7 @@ export async function runPointCheckTiming(db: BenchDb, opts: TimingOptions): Pro
       gitCommit: git.commit,
       gitDirty: git.dirty,
       explainMeanMs,
+      backendPid: backendPidUsed,
     },
     samples,
   };
@@ -1725,6 +1754,7 @@ function run(samples: TimedSample[]): TimingRun {
       gitCommit: 'abc1234',
       gitDirty: false,
       explainMeanMs: 0.021,
+      backendPid: 4242,
     },
     samples,
   };
@@ -1979,6 +2009,7 @@ ${Object.entries(summary.byRule)
 | machine | ${c.machine.cpuModel}, ${c.machine.cpus} cores, ${c.machine.platform}/${c.machine.arch} |
 | commit | ${c.gitCommit ?? 'unknown'}${dirtyNote} |
 | EXPLAIN ANALYZE cross-check | ${c.explainMeanMs === null ? 'not run' : `${ms(c.explainMeanMs)} ms mean (instrumented; corroboration only)`} |
+| pinned backend | ${c.backendPid ?? 'unknown'} — every timed query ran on this one connection |
 
 <details><summary>Indexes present (${c.indexes.length})</summary>
 
@@ -2066,8 +2097,8 @@ Create `packages/db/src/bench.ts`:
  */
 export { createBenchDb } from './bench-schema.js';
 export type { BenchDatabase, BenchDb, GroupRole } from './bench-schema.js';
-export { canSee } from './bench-visibility.js';
-export type { CanSeeResult, VisibilityRule } from './bench-visibility.js';
+export { canSee, visibilityClausesSql } from './bench-visibility.js';
+export type { CanSeeResult, ClauseRow, VisibilityRule } from './bench-visibility.js';
 export {
   expectedVisibility,
   loadPostFacts,
@@ -2397,34 +2428,35 @@ export function buildBenchApp(deps: BenchAppDeps): Express {
     res.json({ ok: true, dataset: deps.databaseName });
   });
 
-  app.post('/bench/timing/point-check', (req, res) => {
+  // Express 5 forwards a rejected handler promise to the error middleware, so an
+  // async handler needs no wrapper. The try/catch is here to turn a refusal to
+  // report into a readable response rather than a stack trace.
+  app.post('/bench/timing/point-check', async (req, res) => {
     const parsed = RequestSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: 'invalid request', detail: parsed.error.issues });
       return;
     }
 
-    void (async () => {
-      try {
-        const run = await runPointCheckTiming(deps.db, {
-          orgId: deps.orgId,
-          databaseName: deps.databaseName,
-          samples: parsed.data.samples,
-          seed: parsed.data.seed,
-          warmup: parsed.data.warmup,
-        });
-        const files = await writeResults(run, deps.resultsDir);
-        res.json({
-          conditions: run.conditions,
-          summary: summarize(run),
-          files: { json: files.jsonPath, markdown: files.mdPath },
-        });
-      } catch (err: unknown) {
-        // A correctness disagreement lands here. It is a refusal to report, not
-        // a crash, and the message names the disagreeing pairs.
-        res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
-      }
-    })();
+    try {
+      const run = await runPointCheckTiming(deps.db, {
+        orgId: deps.orgId,
+        databaseName: deps.databaseName,
+        samples: parsed.data.samples,
+        seed: parsed.data.seed,
+        warmup: parsed.data.warmup,
+      });
+      const files = await writeResults(run, deps.resultsDir);
+      res.json({
+        conditions: run.conditions,
+        summary: summarize(run),
+        files: { json: files.jsonPath, markdown: files.mdPath },
+      });
+    } catch (err: unknown) {
+      // A correctness disagreement or a broken connection pin lands here. It is
+      // a refusal to report, not a crash, and the message names what went wrong.
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   return app;
