@@ -5,7 +5,7 @@ import dotenv from 'dotenv';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { migrate } from '../src/migrate.js';
+import { BENCH_MIGRATIONS_DIR, BENCH_MIGRATIONS_TABLE, migrate } from '../src/migrate.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -58,5 +58,19 @@ describe('migrations', () => {
     await migrate({ direction: 'up', databaseUrl: TEST_DATABASE_URL });
     tables = await tableNames(pool);
     expect(tables).toEqual(expect.arrayContaining(['users', 'posts', 'comments', 'reactions']));
+
+    // This round-trip only re-applies the main migration set, leaving the
+    // bench-only tables (groups, tags, ...) dropped for every test file that
+    // runs after this one in the shared single-fork DB. Restore the
+    // invariant global-setup established — both migration sets applied —
+    // so later bench tests don't depend on vitest's file execution order.
+    await migrate({
+      direction: 'up',
+      databaseUrl: TEST_DATABASE_URL,
+      dir: BENCH_MIGRATIONS_DIR,
+      migrationsTable: BENCH_MIGRATIONS_TABLE,
+    });
+    tables = await tableNames(pool);
+    expect(tables).toEqual(expect.arrayContaining(['groups', 'tags', 'post_audiences']));
   });
 });

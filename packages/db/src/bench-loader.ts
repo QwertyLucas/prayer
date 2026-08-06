@@ -1,3 +1,4 @@
+import { GROUP_COUNT_BUCKETS, GROUP_FIXTURES, expand, pickDistinct } from './bench-fixtures.js';
 import type { BenchDb } from './bench-schema.js';
 import { newId } from './ids.js';
 
@@ -58,4 +59,54 @@ export async function loadMembers(db: BenchDb, orgId: string, count: number): Pr
   }
 
   return ids;
+}
+
+/**
+ * Creates the 58 groups and assigns members according to GROUP_COUNT_BUCKETS.
+ * Returns member id -> group ids so callers can pick group audiences the author
+ * actually belongs to.
+ *
+ * Members are assigned a target group count first, then groups are drawn from
+ * the pool. A member with a target of 0 is left alone — those are the isolated
+ * members the benchmark needs.
+ */
+export async function loadGroups(
+  db: BenchDb,
+  orgId: string,
+  memberIds: readonly string[],
+  rng: () => number,
+): Promise<Map<string, string[]>> {
+  const groupRows = GROUP_FIXTURES.map((g) => ({ id: newId(), church_id: orgId, name: g.name }));
+  await db.insertInto('groups').values(groupRows).execute();
+  const groupIds = groupRows.map((g) => g.id);
+
+  const targets = expand(
+    GROUP_COUNT_BUCKETS.map((b) => ({ count: b.members, value: b.groups })),
+  ).slice(0, memberIds.length);
+
+  const byMember = new Map<string, string[]>();
+  const membershipRows: { group_id: string; user_id: string; role: 'leader' | 'member' }[] = [];
+
+  memberIds.forEach((userId, i) => {
+    const target = targets[i] ?? 0;
+    const chosen = target === 0 ? [] : pickDistinct(rng, groupIds, target);
+    byMember.set(userId, chosen);
+    for (const groupId of chosen) {
+      // Roughly one in ten memberships is a leader. Roles govern actions, never visibility.
+      membershipRows.push({
+        group_id: groupId,
+        user_id: userId,
+        role: rng() < 0.1 ? 'leader' : 'member',
+      });
+    }
+  });
+
+  for (let i = 0; i < membershipRows.length; i += 500) {
+    await db
+      .insertInto('group_members')
+      .values(membershipRows.slice(i, i + 500))
+      .execute();
+  }
+
+  return byMember;
 }
