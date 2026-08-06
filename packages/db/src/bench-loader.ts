@@ -182,12 +182,101 @@ interface AudienceRow {
 }
 
 /**
+ * Whether `kind` can actually be produced for an author with these groups/tags.
+ *
+ * 'multi_group' and 'multi_tag' require *two* candidates, not one — with only
+ * one available, `pickDistinct` would silently degenerate to a single-row
+ * audience while the post body still claimed "multi". Requiring 2 here means
+ * a kind is never assigned unless it can be honestly produced.
+ */
+function isCompatible(
+  kind: AudienceKind,
+  myGroups: readonly string[],
+  myTags: readonly string[],
+): boolean {
+  switch (kind) {
+    case 'church':
+    case 'author_only':
+      return true;
+    case 'one_group':
+      return myGroups.length >= 1;
+    case 'multi_group':
+      return myGroups.length >= 2;
+    case 'one_tag':
+      return myTags.length >= 1;
+    case 'multi_tag':
+      return myTags.length >= 2;
+    case 'group_and_tag':
+      return myGroups.length >= 1 && myTags.length >= 1;
+  }
+}
+
+/** Fisher-Yates, in place, using the given rng. Deterministic per seed. */
+function shuffle<T>(rng: () => number, xs: T[]): void {
+  for (let i = xs.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const a = xs[i];
+    const b = xs[j];
+    if (a === undefined || b === undefined) continue;
+    xs[i] = b;
+    xs[j] = a;
+  }
+}
+
+/**
+ * Processing order for assigning kinds to authors: most-constrained first.
+ *
+ * This is a bin-packing problem — 7 kinds each need a fixed count, each
+ * author has exactly 10 open slots, and each kind is only compatible with
+ * some authors. A single left-to-right greedy pass over a shuffled pool can
+ * still get stuck: a kind with a small eligible pool (e.g. 'multi_group',
+ * needing 2+ groups) can find its candidates already claimed by earlier,
+ * less picky slots, with no way to backtrack.
+ *
+ * Assigning the tightest kinds first — before anything less picky has had a
+ * chance to consume their only eligible slots — avoids that. 'church' goes
+ * last and, uniquely, is NOT capped at its AUDIENCE_MIX count: it absorbs
+ * every slot still open once the rest are placed, so every author ends up
+ * with exactly 10 assigned kinds even if an earlier kind's eligible pool ran
+ * short (only possible at small test populations — see loadPrayers' doc).
+ */
+const ASSIGNMENT_ORDER: readonly AudienceKind[] = [
+  'multi_group',
+  'multi_tag',
+  'group_and_tag',
+  'one_group',
+  'one_tag',
+  'author_only',
+  'church',
+];
+
+/**
  * Ten prayers per member, with audiences drawn from AUDIENCE_MIX.
  *
  * Two constraints keep the data coherent, and both matter for the correctness
  * oracle later: a prayer may only target a tag its author OWNS, and may only
  * target a group its author BELONGS TO. Members in no groups therefore fall back
  * to church-wide — which is exactly why they end up with thin feeds.
+ *
+ * Kind assignment happens in two decorrelated random steps — see
+ * ASSIGNMENT_ORDER's doc for why a naive single pass isn't exact — and the
+ * author-visiting order is shuffled too:
+ *
+ * - Without the kind shuffle: AUDIENCE_MIX's fixed bucket order, plus
+ *   `newId()` being called in this same author-major loop, would make
+ *   audience kind perfectly correlated with posts.id order — the oldest
+ *   posts all church-wide, the newest all group/tag-targeted.
+ * - Without the author-order shuffle: `loadGroups` assigns group-count
+ *   buckets by *position* in `memberIds` (the 100 zero-group members are
+ *   always the first 100), so fallback-heavy authors would cluster at the
+ *   front of the creation sequence regardless of kind shuffling, pulling
+ *   extra always-compatible kinds toward the posts.id values those members
+ *   occupy and reintroducing a smaller but real correlation.
+ *
+ * Since the production feed orders by posts.id DESC, either correlation
+ * alone would explain the "isolated members are slow" signal as an artifact
+ * of insert order rather than of visibility — which is exactly what the
+ * benchmark exists to measure honestly.
  */
 export async function loadPrayers(
   db: BenchDb,
@@ -199,9 +288,47 @@ export async function loadPrayers(
 ): Promise<number> {
   const total = memberIds.length * 10;
   const scale = total / 10000;
-  const kinds = expand(
-    AUDIENCE_MIX.map((m) => ({ count: Math.max(1, Math.round(m.count * scale)), value: m.kind })),
+  const need = new Map<AudienceKind, number>(
+    AUDIENCE_MIX.map((m) => [m.kind, Math.max(1, Math.round(m.count * scale))]),
   );
+
+  const authors = [...memberIds];
+  shuffle(rng, authors);
+
+  const remainingSlots = new Map(authors.map((id) => [id, 10]));
+  const assignedKinds = new Map<string, AudienceKind[]>(authors.map((id) => [id, []]));
+
+  for (const kind of ASSIGNMENT_ORDER) {
+    // One "ticket" per still-open slot on an author this kind is compatible
+    // with. Shuffling before drawing means WHICH eligible author gets this
+    // kind is random, not just the order kinds are considered in.
+    const tickets: string[] = [];
+    for (const authorId of authors) {
+      const remaining = remainingSlots.get(authorId) ?? 0;
+      if (remaining === 0) continue;
+      const myGroups = groupsByMember.get(authorId) ?? [];
+      const myTags = tagsByOwner.get(authorId) ?? [];
+      if (!isCompatible(kind, myGroups, myTags)) continue;
+      for (let i = 0; i < remaining; i++) tickets.push(authorId);
+    }
+    shuffle(rng, tickets);
+
+    // 'church' is the residual bucket (see ASSIGNMENT_ORDER doc): it takes
+    // every remaining ticket instead of stopping at its AUDIENCE_MIX count.
+    const take = kind === 'church' ? tickets.length : Math.min(need.get(kind) ?? 0, tickets.length);
+    for (let i = 0; i < take; i++) {
+      const authorId = tickets[i];
+      if (authorId === undefined) continue;
+      remainingSlots.set(authorId, (remainingSlots.get(authorId) ?? 0) - 1);
+      assignedKinds.get(authorId)?.push(kind);
+    }
+  }
+
+  // Every author's own 10 kinds were appended in ASSIGNMENT_ORDER (tightest
+  // kinds first, 'church' last) — shuffle each author's list so that order
+  // doesn't leak into posts.id order at the fine-grained, single-author-block
+  // scale the way the unshuffled ASSIGNMENT_ORDER would.
+  for (const kinds of assignedKinds.values()) shuffle(rng, kinds);
 
   const now = Date.now();
   const posts: {
@@ -215,23 +342,13 @@ export async function loadPrayers(
   }[] = [];
   const audiences: AudienceRow[] = [];
 
-  let k = 0;
-  for (const authorId of memberIds) {
-    for (let n = 0; n < 10; n++) {
+  for (const authorId of authors) {
+    const myGroups = groupsByMember.get(authorId) ?? [];
+    const myTags = tagsByOwner.get(authorId) ?? [];
+    const kindsForAuthor = assignedKinds.get(authorId) ?? [];
+
+    kindsForAuthor.forEach((kind, n) => {
       const postId = newId();
-      const requested: AudienceKind = kinds[k % kinds.length] ?? 'church';
-      k++;
-
-      const myGroups = groupsByMember.get(authorId) ?? [];
-      const myTags = tagsByOwner.get(authorId) ?? [];
-
-      // Fall back to church-wide when the author has no group to share into.
-      let kind = requested;
-      if ((kind === 'one_group' || kind === 'multi_group') && myGroups.length === 0)
-        kind = 'church';
-      if (kind === 'group_and_tag' && (myGroups.length === 0 || myTags.length === 0))
-        kind = 'church';
-      if ((kind === 'one_tag' || kind === 'multi_tag') && myTags.length === 0) kind = 'church';
 
       posts.push({
         id: postId,
@@ -278,7 +395,7 @@ export async function loadPrayers(
         case 'author_only':
           break;
       }
-    }
+    });
   }
 
   for (let i = 0; i < posts.length; i += 500) {

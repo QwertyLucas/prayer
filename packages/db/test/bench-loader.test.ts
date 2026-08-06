@@ -262,4 +262,106 @@ describe('loadPrayers', () => {
       .execute();
     for (const r of rows) expect(r.edit_deadline).not.toBeNull();
   });
+
+  it('decorrelates audience kind from post insertion order', async () => {
+    // Regression test: AUDIENCE_MIX's fixed bucket order plus newId() being
+    // called in the same author-major loop used to make audience kind
+    // perfectly correlated with posts.id order. Since the feed orders by
+    // posts.id DESC, that alone (not visibility) explained why isolated
+    // members looked slow — the benchmark measured insert order, not
+    // visibility. Under the old code, the first 1,000 posts by id (the
+    // oldest) were 100% 'church' and the last 1,000 (the newest) were 0%
+    // 'church'. Shuffled, both halves should land close to the overall
+    // church share.
+    const orgId = await loadOrg(db, 'bench-decorrelation');
+    const members = await loadMembers(db, orgId, 1000);
+    const rng = makeRng(16);
+    const groups = await loadGroups(db, orgId, members, rng);
+    const tags = await loadTags(db, orgId, members, rng);
+    await loadPrayers(db, orgId, members, groups, tags, rng);
+
+    const rows = await db
+      .selectFrom('posts')
+      .select('body')
+      .where('org_id', '=', orgId)
+      .orderBy('id', 'asc')
+      .execute();
+    expect(rows).toHaveLength(10000);
+
+    const kindOf = (body: string) => body.match(/\(([a-z_]+)\)$/)?.[1] ?? 'unknown';
+    const churchShare = (bodies: string[]) =>
+      bodies.filter((b) => kindOf(b) === 'church').length / bodies.length;
+
+    const oldestThousand = rows.slice(0, 1000).map((r) => r.body);
+    const newestThousand = rows.slice(-1000).map((r) => r.body);
+
+    expect(Math.abs(churchShare(oldestThousand) - churchShare(newestThousand))).toBeLessThan(0.15);
+  });
+
+  it('keeps the exact AUDIENCE_MIX per-kind counts at N=1000 despite fallback repairs', async () => {
+    // The shuffle-then-repair fallback (loadPrayers) only ever swaps pool
+    // entries to satisfy a given author's group/tag constraints — it never
+    // adds or removes one. So the per-kind totals below must match
+    // AUDIENCE_MIX exactly, the same as before the shuffle was introduced.
+    const orgId = await loadOrg(db, 'bench-mix-exact');
+    const members = await loadMembers(db, orgId, 1000);
+    const rng = makeRng(17);
+    const groups = await loadGroups(db, orgId, members, rng);
+    const tags = await loadTags(db, orgId, members, rng);
+    await loadPrayers(db, orgId, members, groups, tags, rng);
+
+    const rows = await db.selectFrom('posts').select('body').where('org_id', '=', orgId).execute();
+
+    const counts: Record<string, number> = {};
+    for (const r of rows) {
+      const kind = r.body.match(/\(([a-z_]+)\)$/)?.[1] ?? 'unknown';
+      counts[kind] = (counts[kind] ?? 0) + 1;
+    }
+
+    expect(counts).toEqual({
+      church: 4000,
+      one_group: 2200,
+      multi_group: 900,
+      one_tag: 1500,
+      multi_tag: 400,
+      group_and_tag: 800,
+      author_only: 200,
+    });
+  });
+
+  it('never leaves a multi_group or multi_tag post with a single audience row', async () => {
+    // Regression test for the labeling bug: pickDistinct silently caps at
+    // pool size, so a 'multi_*' post authored by someone with only one
+    // candidate used to produce a single audience row while the body still
+    // said "multi". isCompatible now requires >=2 candidates before a multi
+    // kind is assigned at all.
+    const orgId = await loadOrg(db, 'bench-multi-integrity');
+    const members = await loadMembers(db, orgId, 1000);
+    const rng = makeRng(18);
+    const groups = await loadGroups(db, orgId, members, rng);
+    const tags = await loadTags(db, orgId, members, rng);
+    await loadPrayers(db, orgId, members, groups, tags, rng);
+
+    const rows = await db
+      .selectFrom('posts')
+      .leftJoin('post_audiences', 'post_audiences.post_id', 'posts.id')
+      .select(({ fn }) => ['posts.id', fn.count<string>('post_audiences.post_id').as('n')])
+      .where('posts.org_id', '=', orgId)
+      .where('posts.body', 'like', '%(multi_group)')
+      .groupBy('posts.id')
+      .execute();
+    expect(rows.length).toBeGreaterThan(0);
+    for (const r of rows) expect(Number(r.n)).toBeGreaterThanOrEqual(2);
+
+    const tagRows = await db
+      .selectFrom('posts')
+      .leftJoin('post_audiences', 'post_audiences.post_id', 'posts.id')
+      .select(({ fn }) => ['posts.id', fn.count<string>('post_audiences.post_id').as('n')])
+      .where('posts.org_id', '=', orgId)
+      .where('posts.body', 'like', '%(multi_tag)')
+      .groupBy('posts.id')
+      .execute();
+    expect(tagRows.length).toBeGreaterThan(0);
+    for (const r of tagRows) expect(Number(r.n)).toBeGreaterThanOrEqual(2);
+  });
 });
