@@ -69,8 +69,16 @@ export interface RunConditions {
   timestamp: string;
   gitCommit: string | null;
   gitDirty: boolean | null;
-  /** EXPLAIN ANALYZE corroboration over a subsample. Inflated by instrumentation; not the headline. */
-  explainMeanMs: number | null;
+  /**
+   * EXPLAIN ANALYZE corroboration over a subsample, split into the two figures
+   * Postgres actually reports. Both are inflated by EXPLAIN's own
+   * instrumentation, so neither replaces the wall-clock figures — they
+   * corroborate. Kept separate (rather than summed into one "explain" figure)
+   * because for this query shape planning dominates execution by roughly 7x;
+   * a single combined number would bury that finding.
+   */
+  explainPlanningMeanMs: number | null;
+  explainExecutionMeanMs: number | null;
   /** The single Postgres backend every timed query ran on. Proves the floor is comparable. */
   backendPid: number | null;
 }
@@ -93,29 +101,50 @@ const INDEXED_TABLES = ['post_audiences', 'group_members', 'tag_members', 'user_
 const EXPLAIN_SUBSAMPLE = 20;
 
 interface ExplainRow {
-  'QUERY PLAN': { 'Execution Time': number }[];
+  'QUERY PLAN': { 'Planning Time': number; 'Execution Time': number }[];
+}
+
+export interface ExplainSubsampleResult {
+  planningMeanMs: number | null;
+  executionMeanMs: number | null;
 }
 
 /**
- * Mean in-database execution time over a handful of already-timed pairs.
+ * Mean in-database planning and execution time over a handful of
+ * already-timed pairs, kept as two separate figures rather than one.
+ *
+ * Postgres's own EXPLAIN output distinguishes "Planning Time" (choosing a
+ * plan) from "Execution Time" (running it) — collapsing them into a single
+ * number would hide which one actually dominates. For this query shape,
+ * planning has been measured at roughly 7x execution, so labeling only the
+ * execution figure as "the" database cost silently misrepresents where the
+ * time goes.
  *
  * Reported as corroboration only. EXPLAIN ANALYZE's own instrumentation
- * inflates the number it produces, which is exactly why the headline marginal
- * cost comes from floor subtraction instead.
+ * inflates both numbers it produces, which is exactly why the headline
+ * marginal cost comes from floor subtraction instead.
  */
-async function explainSubsample(db: BenchDb, samples: TimedSample[]): Promise<number | null> {
-  if (samples.length === 0) return null;
-  const times: number[] = [];
+async function explainSubsample(
+  db: BenchDb,
+  samples: TimedSample[],
+): Promise<ExplainSubsampleResult> {
+  if (samples.length === 0) return { planningMeanMs: null, executionMeanMs: null };
+  const planningTimes: number[] = [];
+  const executionTimes: number[] = [];
   for (const s of samples) {
     // Explains the EXACT statement canSee runs, not a paraphrase of it.
     const explained = await sql<ExplainRow>`
       EXPLAIN (ANALYZE, TIMING ON, FORMAT JSON) ${visibilityClausesSql(s.viewerId, s.postId)}
     `.execute(db);
     const plan = explained.rows[0]?.['QUERY PLAN'][0];
-    if (plan !== undefined) times.push(plan['Execution Time']);
+    if (plan !== undefined) {
+      planningTimes.push(plan['Planning Time']);
+      executionTimes.push(plan['Execution Time']);
+    }
   }
-  if (times.length === 0) return null;
-  return times.reduce((a, b) => a + b, 0) / times.length;
+  const mean = (xs: number[]): number | null =>
+    xs.length === 0 ? null : xs.reduce((a, b) => a + b, 0) / xs.length;
+  return { planningMeanMs: mean(planningTimes), executionMeanMs: mean(executionTimes) };
 }
 
 /** The Postgres backend serving this connection. Used to prove the connection was pinned. */
@@ -124,10 +153,25 @@ async function backendPid(db: BenchDb): Promise<number> {
   return Number(row.rows[0]?.pid ?? 0);
 }
 
-function gitInfo(): { commit: string | null; dirty: boolean | null } {
+/**
+ * `cwd` defaults to the process's working directory; exposed as a parameter
+ * (rather than hardcoded) purely so tests can point it at a disposable repo
+ * instead of asserting against whatever this checkout happens to look like.
+ */
+export function gitInfo(cwd: string = process.cwd()): {
+  commit: string | null;
+  dirty: boolean | null;
+} {
   try {
-    const commit = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
-    const status = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' });
+    const commit = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8', cwd }).trim();
+    // --untracked-files=no: dirty means "a tracked file the commit doesn't
+    // account for has changed," not "there is untracked cruft lying around."
+    // An untracked scratch file (a screenshot, a note) doesn't affect what
+    // code ran, so it must not flag a reproducible run as dirty.
+    const status = execFileSync('git', ['status', '--porcelain', '--untracked-files=no'], {
+      encoding: 'utf8',
+      cwd,
+    });
     return { commit, dirty: status.trim().length > 0 };
   } catch {
     // Not a git checkout, or git is unavailable. Recorded as unknown rather than guessed.
@@ -223,7 +267,8 @@ export async function runPointCheckTiming(
 
   const samples: TimedSample[] = [];
   const disagreements: string[] = [];
-  let explainMeanMs: number | null = null;
+  let explainPlanningMeanMs: number | null = null;
+  let explainExecutionMeanMs: number | null = null;
   let backendPidUsed: number | null = null;
 
   // EVERY timed query runs on ONE pinned connection. `createBenchDb` builds a
@@ -287,7 +332,9 @@ export async function runPointCheckTiming(
     // instrumentation overhead never lands in the reported numbers. EXPLAIN
     // ANALYZE inflates what it measures, so this is corroboration that the
     // marginal figure is the right order of magnitude — not a second estimate.
-    explainMeanMs = await explainSubsample(conn, samples.slice(0, EXPLAIN_SUBSAMPLE));
+    const explainResult = await explainSubsample(conn, samples.slice(0, EXPLAIN_SUBSAMPLE));
+    explainPlanningMeanMs = explainResult.planningMeanMs;
+    explainExecutionMeanMs = explainResult.executionMeanMs;
 
     // Proof, not assumption. If the pool handed us a different backend part way
     // through, every floor measurement is against a connection the check never
@@ -313,7 +360,12 @@ export async function runPointCheckTiming(
   }
 
   const versionRow = await sql<{ v: string }>`SELECT version() AS v`.execute(db);
-  const buffersRow = await sql<{ setting: string }>`SHOW shared_buffers`.execute(db);
+  // `SHOW shared_buffers` returns a column literally named `shared_buffers`,
+  // not `setting` — a `SELECT ... AS setting` query names its own column, so
+  // it can't silently fall through to 'unknown' the way `SHOW` did here.
+  const buffersRow = await sql<{ setting: string }>`
+    SELECT current_setting('shared_buffers') AS setting
+  `.execute(db);
   const indexRows = await sql<{ indexdef: string }>`
     SELECT indexdef FROM pg_indexes
      WHERE schemaname = 'public' AND tablename = ANY(${INDEXED_TABLES})
@@ -343,7 +395,8 @@ export async function runPointCheckTiming(
       timestamp: new Date().toISOString(),
       gitCommit: git.commit,
       gitDirty: git.dirty,
-      explainMeanMs,
+      explainPlanningMeanMs,
+      explainExecutionMeanMs,
       backendPid: backendPidUsed,
     },
     samples,

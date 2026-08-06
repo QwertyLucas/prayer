@@ -1,7 +1,12 @@
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { createBenchDb, type BenchDb } from '../src/bench-schema.js';
-import { runPointCheckTiming } from '../src/bench-timing.js';
+import { gitInfo, runPointCheckTiming } from '../src/bench-timing.js';
 
 import { buildVisibilityFixture, type VisibilityFixture } from './helpers/visibility-fixtures.js';
 
@@ -64,9 +69,19 @@ describe('runPointCheckTiming', () => {
     expect(c.machine.cpus).toBeGreaterThan(0);
     expect(c.indexes.length).toBeGreaterThan(0);
     expect(c.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
-    // Corroboration pass ran and produced a plausible in-database figure.
-    expect(c.explainMeanMs).not.toBeNull();
-    expect(c.explainMeanMs ?? 0).toBeGreaterThan(0);
+    // Corroboration pass ran and produced plausible in-database figures for
+    // BOTH planning and execution — collapsing them into one number would
+    // hide which of the two actually dominates.
+    expect(c.explainPlanningMeanMs).not.toBeNull();
+    expect(c.explainPlanningMeanMs ?? 0).toBeGreaterThan(0);
+    expect(c.explainExecutionMeanMs).not.toBeNull();
+    expect(c.explainExecutionMeanMs ?? 0).toBeGreaterThan(0);
+    // `SHOW shared_buffers` names its column `shared_buffers`, not `setting` —
+    // reading it under the wrong column name silently falls back to
+    // 'unknown' on every run. Assert the real recorded value, not merely
+    // that some string was produced.
+    expect(c.sharedBuffers).not.toBe('unknown');
+    expect(c.sharedBuffers).toMatch(/^\d+\s*(kB|MB|GB)$/i);
   });
 
   it('runs every timed query on one pinned Postgres backend', async () => {
@@ -164,5 +179,44 @@ describe('runPointCheckTiming', () => {
       databaseName: 'prayer_test',
     });
     expect(run.samples).toHaveLength(45);
+  });
+});
+
+describe('gitInfo', () => {
+  // Uses a disposable repo rather than asserting against this checkout's own
+  // status, so the test doesn't depend on (or get confused by) whatever
+  // tracked or untracked changes happen to be sitting in this working tree
+  // when the suite runs.
+  function makeTempRepo(): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bench-timing-gitinfo-'));
+    execFileSync('git', ['init', '-q'], { cwd: dir });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir });
+    fs.writeFileSync(path.join(dir, 'tracked.txt'), 'original');
+    execFileSync('git', ['add', 'tracked.txt'], { cwd: dir });
+    execFileSync('git', ['commit', '-q', '-m', 'initial'], { cwd: dir });
+    return dir;
+  }
+
+  it('does not flag a run dirty for an untracked file', () => {
+    const dir = makeTempRepo();
+    try {
+      // A screenshot, a scratch note — never committed, never run. This must
+      // not make a reproducible run look dirty.
+      fs.writeFileSync(path.join(dir, 'untracked.png'), 'not-really-a-png');
+      expect(gitInfo(dir).dirty).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('flags a run dirty when a tracked file has uncommitted changes', () => {
+    const dir = makeTempRepo();
+    try {
+      fs.writeFileSync(path.join(dir, 'tracked.txt'), 'modified');
+      expect(gitInfo(dir).dirty).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
