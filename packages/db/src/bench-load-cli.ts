@@ -32,16 +32,72 @@ const MIXES: Record<string, AudienceMix> = {
   stress: STRESS_AUDIENCE_MIX,
 };
 
-function parseMix(argv: string[]): { name: string; mix: AudienceMix } {
-  const idx = argv.indexOf('--mix');
-  const name = idx === -1 ? 'realistic' : (argv[idx + 1] ?? '');
+const USAGE =
+  'Usage: BENCH_DATABASE_URL=… pnpm bench:load [--mix realistic|stress]\n' +
+  '  --mix stress  requires a database whose name contains "stress".';
+
+/**
+ * Resolves the mix from argv and cross-checks it against the target database.
+ *
+ * Three separate mistakes to make unreachable, all of which used to produce a
+ * successful-looking load of the wrong dataset:
+ *
+ * - `--mix=stress` (the `=` form) did not match `argv.indexOf('--mix')`, so it
+ *   silently loaded the **realistic** mix into prayer_bench_stress. Nothing
+ *   downstream could tell; every conclusion drawn from that database would
+ *   have been wrong.
+ * - Any typo (`--mixx`, `--stress`) did the same thing, silently.
+ * - Even a correctly-parsed flag can point at the wrong database. The database
+ *   name is the one piece of intent that is impossible to get wrong by
+ *   accident, so it is the authority: `…_stress` demands the stress mix and
+ *   nothing else may have it.
+ */
+export function parseMix(
+  argv: readonly string[],
+  dbName: string,
+): { name: string; mix: AudienceMix } {
+  let name = 'realistic';
+
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    if (token === undefined) continue;
+    if (token.startsWith('--mix=')) {
+      name = token.slice('--mix='.length);
+      continue;
+    }
+    if (token === '--mix') {
+      const next = argv[i + 1];
+      if (next === undefined) throw new Error(`--mix needs a value.\n${USAGE}`);
+      name = next;
+      i++;
+      continue;
+    }
+    throw new Error(`Unrecognised argument "${token}".\n${USAGE}`);
+  }
+
   const mix = MIXES[name];
   if (!mix) {
     throw new Error(
-      `Unknown --mix "${name}". Expected one of: ${Object.keys(MIXES).join(', ')}.\n` +
-        'Usage: BENCH_DATABASE_URL=… pnpm bench:load [--mix realistic|stress]',
+      `Unknown --mix "${name}". Expected one of: ${Object.keys(MIXES).join(', ')}.\n${USAGE}`,
     );
   }
+
+  const dbIsStress = dbName.includes('stress');
+  if (dbIsStress && name !== 'stress') {
+    throw new Error(
+      `"${dbName}" is the stress database but --mix is "${name}".\n` +
+        'Loading the realistic mix there would leave a database whose name promises one\n' +
+        `dataset and whose contents are another. Pass --mix stress.\n${USAGE}`,
+    );
+  }
+  if (!dbIsStress && name === 'stress') {
+    throw new Error(
+      `--mix stress was requested but "${dbName}" is not a stress database.\n` +
+        'The stress dataset belongs in its own database, e.g. prayer_bench_stress, so the two\n' +
+        `mixes never overwrite each other.\n${USAGE}`,
+    );
+  }
+
   return { name, mix };
 }
 
@@ -87,12 +143,14 @@ export function assertBenchDatabase(url: string): void {
 /**
  * Refuses a target that already holds data, before any migration runs.
  *
- * Two mistakes to stop, and this is the last moment at which stopping is free:
+ * Three mistakes to stop, and this is the last moment at which stopping is free:
  *
  * - a second `bench:load` into an already-loaded bench database, which appends
  *   another 1,000 members and 10,000 prayers to the same org — the per-kind
  *   ratios still look right while every per-member number (feed depth, the
  *   isolated cohort) has quietly doubled;
+ * - a bench database holding a *partial* population — users but no prayers —
+ *   which the posts check alone waves straight through;
  * - an application database that slipped past the name check, which must not
  *   receive bench tables at all.
  *
@@ -117,6 +175,25 @@ export async function assertLoadable(db: BenchDb, name: string): Promise<void> {
     );
   }
 
+  // Prayers alone are not enough. A load that died after loadMembers leaves
+  // users and zero posts, and adopting that org on the next run doubles the
+  // population while the summary still prints 1,000. `loadBenchDataset` is
+  // transactional now, so this is the belt to that braces: it catches the same
+  // state arriving by any other route (an interrupted psql session, a
+  // hand-run loadMembers, a restore from a partial dump).
+  const users = await db
+    .selectFrom('users')
+    .select(({ fn }) => fn.count<string>('id').as('n'))
+    .executeTakeFirstOrThrow();
+  if (Number(users.n) > 0) {
+    throw new Error(
+      `"${name}" already holds ${users.n} users but no prayers — a previous load stopped\n` +
+        'part-way through. Re-running would append a second population to the same org and\n' +
+        'every per-member number would be silently wrong.\n' +
+        'Drop and recreate the database, then re-run.',
+    );
+  }
+
   const foreign = await db
     .selectFrom('orgs')
     .select('slug')
@@ -135,7 +212,7 @@ async function main(): Promise<void> {
   if (!url) throw new Error('BENCH_DATABASE_URL is required');
   assertLocal(url);
   assertBenchDatabase(url);
-  const { name, mix } = parseMix(process.argv.slice(2));
+  const { name, mix } = parseMix(process.argv.slice(2), databaseName(url));
 
   const db = createBenchDb(url);
   try {
@@ -171,6 +248,8 @@ async function main(): Promise<void> {
     console.log(`  mix        ${name}`);
     console.log(`  org        ${summary.orgId}`);
     console.log(`  members    ${summary.members}`);
+    console.log(`  moderators ${summary.moderators}`);
+    console.log(`  superusers ${summary.superUsers}`);
     console.log(`  groups     ${summary.groups}`);
     console.log(`  tags       ${summary.tags}`);
     console.log(`  prayers    ${summary.prayers}`);
