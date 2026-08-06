@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { GROUP_FIXTURES, makeRng } from '../src/bench-fixtures.js';
-import { loadGroups, loadMembers, loadOrg } from '../src/bench-loader.js';
+import { loadGroups, loadMembers, loadOrg, loadTags } from '../src/bench-loader.js';
 import { createBenchDb, type BenchDb } from '../src/bench-schema.js';
 
 const url = process.env.TEST_DATABASE_URL as string;
@@ -97,5 +97,71 @@ describe('loadGroups', () => {
 
     const shape = (m: Map<string, string[]>) => [...m.values()].map((v) => v.length);
     expect(shape(ga)).toEqual(shape(gb));
+  });
+});
+
+describe('loadTags', () => {
+  it('gives every member between 1 and 3 tags', async () => {
+    const orgId = await loadOrg(db, 'bench-tags');
+    const members = await loadMembers(db, orgId, 300);
+    const byOwner = await loadTags(db, orgId, members, makeRng(5));
+
+    expect(byOwner.size).toBe(300);
+    for (const tags of byOwner.values()) {
+      expect(tags.length).toBeGreaterThanOrEqual(1);
+      expect(tags.length).toBeLessThanOrEqual(3);
+    }
+  });
+
+  it('never puts the owner inside their own tag — the author clause covers them', async () => {
+    const orgId = await loadOrg(db, 'bench-tag-owner');
+    const members = await loadMembers(db, orgId, 100);
+    await loadTags(db, orgId, members, makeRng(6));
+
+    const selfMembers = await db
+      .selectFrom('tag_members')
+      .innerJoin('tags', 'tags.id', 'tag_members.tag_id')
+      .select('tags.id')
+      .where('tags.church_id', '=', orgId)
+      .whereRef('tags.owner_id', '=', 'tag_members.user_id')
+      .execute();
+    expect(selfMembers).toHaveLength(0);
+  });
+
+  it('puts between 3 and 12 members in each tag', async () => {
+    const orgId = await loadOrg(db, 'bench-tag-size');
+    const members = await loadMembers(db, orgId, 200);
+    await loadTags(db, orgId, members, makeRng(7));
+
+    const sizes = await db
+      .selectFrom('tag_members')
+      .innerJoin('tags', 'tags.id', 'tag_members.tag_id')
+      .select(({ fn }) => ['tag_members.tag_id', fn.count<string>('tag_members.user_id').as('n')])
+      .where('tags.church_id', '=', orgId)
+      .groupBy('tag_members.tag_id')
+      .execute();
+
+    expect(sizes.length).toBeGreaterThan(0);
+    for (const s of sizes) {
+      expect(Number(s.n)).toBeGreaterThanOrEqual(3);
+      expect(Number(s.n)).toBeLessThanOrEqual(12);
+    }
+  });
+
+  it('gives one owner distinct tag names', async () => {
+    const orgId = await loadOrg(db, 'bench-tag-names');
+    const members = await loadMembers(db, orgId, 50);
+    await loadTags(db, orgId, members, makeRng(8));
+
+    const rows = await db
+      .selectFrom('tags')
+      .select(['owner_id', 'name'])
+      .where('church_id', '=', orgId)
+      .execute();
+    const perOwner = new Map<string, string[]>();
+    for (const r of rows) perOwner.set(r.owner_id, [...(perOwner.get(r.owner_id) ?? []), r.name]);
+    for (const names of perOwner.values()) {
+      expect(new Set(names).size).toBe(names.length);
+    }
   });
 });

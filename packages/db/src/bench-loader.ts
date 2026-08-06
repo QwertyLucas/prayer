@@ -1,4 +1,10 @@
-import { GROUP_COUNT_BUCKETS, GROUP_FIXTURES, expand, pickDistinct } from './bench-fixtures.js';
+import {
+  GROUP_COUNT_BUCKETS,
+  GROUP_FIXTURES,
+  TAG_NAMES,
+  expand,
+  pickDistinct,
+} from './bench-fixtures.js';
 import type { BenchDb } from './bench-schema.js';
 import { newId } from './ids.js';
 
@@ -109,4 +115,58 @@ export async function loadGroups(
   }
 
   return byMember;
+}
+
+/**
+ * Every member owns 1-3 tags, each holding 3-12 other members.
+ *
+ * The owner is deliberately NOT a member of their own tag — that mirrors the
+ * real shape (Alice's "family" tag lists John and Taylor, not Alice) and makes
+ * the author clause in the visibility rule load-bearing rather than decorative.
+ */
+export async function loadTags(
+  db: BenchDb,
+  orgId: string,
+  memberIds: readonly string[],
+  rng: () => number,
+): Promise<Map<string, string[]>> {
+  const tagRows: { id: string; owner_id: string; church_id: string; name: string }[] = [];
+  const byOwner = new Map<string, string[]>();
+
+  for (const ownerId of memberIds) {
+    const howMany = 1 + Math.floor(rng() * 3); // 1, 2, or 3
+    const names = pickDistinct(rng, TAG_NAMES, howMany);
+    const ids: string[] = [];
+    for (const name of names) {
+      const id = newId();
+      ids.push(id);
+      tagRows.push({ id, owner_id: ownerId, church_id: orgId, name });
+    }
+    byOwner.set(ownerId, ids);
+  }
+
+  for (let i = 0; i < tagRows.length; i += 500) {
+    await db
+      .insertInto('tags')
+      .values(tagRows.slice(i, i + 500))
+      .execute();
+  }
+
+  const memberRows: { tag_id: string; user_id: string }[] = [];
+  for (const tag of tagRows) {
+    const candidates = memberIds.filter((m) => m !== tag.owner_id);
+    const size = 3 + Math.floor(rng() * 10); // 3..12
+    for (const userId of pickDistinct(rng, candidates, size)) {
+      memberRows.push({ tag_id: tag.id, user_id: userId });
+    }
+  }
+
+  for (let i = 0; i < memberRows.length; i += 500) {
+    await db
+      .insertInto('tag_members')
+      .values(memberRows.slice(i, i + 500))
+      .execute();
+  }
+
+  return byOwner;
 }
